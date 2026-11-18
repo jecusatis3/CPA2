@@ -1,0 +1,1432 @@
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/addrootspan.go b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/addrootspan.go
+new file mode 100644
+index 00000000..07b65bca
+--- /dev/null
++++ b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/addrootspan.go
+@@ -0,0 +1,92 @@
++package adjuster
++
++import (
++	"go.opentelemetry.io/collector/pdata/pcommon"
++	"go.opentelemetry.io/collector/pdata/ptrace"
++)
++
++// AddRootSpan creates an adjuster that adds a root span to the trace that covers the duration of all children spans.
++// Children spans with an emprt parent use the root span as their parent, so this root span should be the only "root" (span without a parent) in the trace
++func AddRootSpan(enabled bool) Adjuster {
++	return Func(func(traces ptrace.Traces) {
++		if !enabled {
++			return
++		}
++		adjuster := &rootSpanAdjuster{
++			traces: traces,
++		}
++		adjuster.createRootSpan()
++	})
++}
++
++type rootSpanAdjuster struct{
++	traces ptrace.Traces
++}
++
++// iterate through all spans to find the earliest start and latest end
++// this indicates the duration of the root span
++// also attach all spans with an empty parent to the root span
++// so the only span with an empty parent after this pass should be the root span that we add
++func (a *rootSpanAdjuster) createRootSpan() {
++	minStart := getMaxTime()
++	maxEnd := getMinTime()
++	traceID := pcommon.NewTraceIDEmpty()
++	rootSpanChildren := make(map[*ptrace.Span]struct{})
++	allSpanIDs := make(map[pcommon.SpanID]struct{})
++
++	resourceSpans := a.traces.ResourceSpans()
++	for i := 0; i < resourceSpans.Len(); i++ {
++		rs := resourceSpans.At(i)
++		scopeSpans := rs.ScopeSpans()
++		for j := 0; j < scopeSpans.Len(); j++ {
++			ss := scopeSpans.At(j)
++			spans := ss.Spans()
++			for k := 0; k < spans.Len(); k++ {
++				span := spans.At(k)
++
++				//add id to set of all span ids, used to check if root span id is already taken
++				allSpanIDs[span.SpanID()] = struct{}{}
++
++				//get trace id from first span
++				if traceID.IsEmpty() {
++					traceID = span.TraceID()
++				}
++				//if span doesn't have a parent, its parent will be the root span that we are adding
++				if span.ParentSpanID() == pcommon.NewSpanIDEmpty() {
++					//actually attach later once the root span id is set
++					rootSpanChildren[&span] = struct{}{}
++				}
++				spanStartTime := span.StartTimestamp()
++				spanEndTime := span.EndTimestamp()
++				if spanStartTime.AsTime().Before(minStart.AsTime()) {
++					minStart = spanStartTime
++				}
++				if spanEndTime.AsTime().After(maxEnd.AsTime()) {
++					maxEnd = spanEndTime
++				}
++			}
++		}
++	}
++
++	// get root span id; is 0000000000000001 by default but is incremented if that already exists in the trace
++	rootSpanID := getRootSpanID(allSpanIDs)
++
++	// set root span as parent for all spans without parent
++	for rootSpanChild := range rootSpanChildren {
++		rootSpanChild.SetParentSpanID(rootSpanID)
++	}
++
++	// add the root span to the trace
++	updatedResourceSpans := a.traces.ResourceSpans().AppendEmpty()
++	updatedResourceSpans.Resource().Attributes().PutStr("service.name", "ROOT")
++
++	scopeSpans := updatedResourceSpans.ScopeSpans().AppendEmpty()
++
++	span := scopeSpans.Spans().AppendEmpty()
++	span.SetTraceID(traceID)
++	span.SetSpanID(rootSpanID)
++	span.SetParentSpanID(pcommon.NewSpanIDEmpty())
++	span.SetName("ROOT")
++	span.SetStartTimestamp(pcommon.NewTimestampFromTime(minStart.AsTime()))
++	span.SetEndTimestamp(pcommon.NewTimestampFromTime(maxEnd.AsTime()))
++}
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/addrootspan_test.go b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/addrootspan_test.go
+new file mode 100644
+index 00000000..531e5afd
+--- /dev/null
++++ b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/addrootspan_test.go
+@@ -0,0 +1,109 @@
++package adjuster
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"go.opentelemetry.io/collector/pdata/pcommon"
++	"go.opentelemetry.io/collector/pdata/ptrace"
++)
++
++func TestAddRootSpanAdjuster(t *testing.T) {
++	type testSpan struct {
++		id, parent          [8]byte
++		startTime, duration int
++	}
++
++	toTime := func(t int) time.Time {
++		return time.Unix(0, (time.Duration(t) * time.Millisecond).Nanoseconds())
++	}
++
++	// helper function that constructs a trace from a list of span prototypes
++	makeTrace := func(spanPrototypes []testSpan) ptrace.Traces {
++		trace := ptrace.NewTraces()
++		for _, spanProto := range spanPrototypes {
++			traceID := pcommon.TraceID([16]byte{0, 0, 0, 0, 0, 0, 0, 1})
++			span := ptrace.NewSpan()
++			span.SetTraceID(traceID)
++			span.SetSpanID(spanProto.id)
++			span.SetParentSpanID(spanProto.parent)
++			span.SetStartTimestamp(pcommon.NewTimestampFromTime(toTime(spanProto.startTime)))
++			span.SetEndTimestamp(pcommon.NewTimestampFromTime(toTime(spanProto.startTime + spanProto.duration)))
++
++			resource := ptrace.NewResourceSpans()
++
++			span.CopyTo(resource.ScopeSpans().AppendEmpty().Spans().AppendEmpty())
++			resource.CopyTo(trace.ResourceSpans().AppendEmpty())
++		}
++		return trace
++	}
++
++	testCases := []struct {
++		description string
++		trace       []testSpan
++	}{
++		{
++			description: "single span with root as parent",
++			trace: []testSpan{
++				{id: [8]byte{2}, parent: [8]byte{0}, startTime: 0, duration: 100},
++			},
++		},
++		{
++			description: "two spans, both have root as parent",
++			trace: []testSpan{
++				{id: [8]byte{2}, parent: [8]byte{0}, startTime: 0, duration: 100},
++				{id: [8]byte{3}, parent: [8]byte{0}, startTime: 100, duration: 100},
++			},
++		},
++		{
++			description: "two spans, parent-child",
++			trace: []testSpan{
++				{id: [8]byte{2}, parent: [8]byte{0}, startTime: 0, duration: 100},
++				{id: [8]byte{3}, parent: [8]byte{2}, startTime: 10, duration: 50},
++			},
++		},
++	}
++
++	for _, tt := range testCases {
++		testCase := tt // capture loop var
++		t.Run(testCase.description, func(t *testing.T) {
++			trace := makeTrace(testCase.trace)
++			adjuster := AddRootSpan(true)
++			adjuster.Adjust(trace)
++
++			minStart := getMaxTime()
++			maxEnd := getMinTime()
++			for i, proto := range testCase.trace {
++				id := proto.id
++				span := trace.ResourceSpans().At(i).ScopeSpans().At(0).Spans().At(0)
++				require.EqualValues(t, proto.id, span.SpanID(), "expecting span with span ID = %d", id)
++
++				// get earliest start time and latest end time
++				spanStartTime := span.StartTimestamp()
++				spanEndTime := span.EndTimestamp()
++				if spanStartTime.AsTime().Before(minStart.AsTime()) {
++					minStart = spanStartTime
++				}
++				if spanEndTime.AsTime().After(maxEnd.AsTime()) {
++					maxEnd = spanEndTime
++				}
++
++				// if the span was set up with an empty parent, check that it now has root as its parent
++				if proto.parent == [8]byte{0} {
++					assert.Equal(t, pcommon.SpanID([8]byte{0, 0, 0, 0, 0, 0, 0, 1}), span.ParentSpanID())
++				}
++			}
++
++			rootSpan := trace.ResourceSpans().At(len(testCase.trace)).ScopeSpans().At(0).Spans().At(0)
++			// verify that the last span in the trace is the newly added root span
++			assert.Equal(t, pcommon.SpanID([8]byte{0, 0, 0, 0, 0, 0, 0, 1}), rootSpan.SpanID())
++
++			// test root span duration
++			assert.Equal(t, minStart.AsTime(), rootSpan.StartTimestamp().AsTime())
++			assert.Equal(t, maxEnd.AsTime(), rootSpan.EndTimestamp().AsTime())
++
++		})
++	}
++}
+\ No newline at end of file
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/clockskew.go b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/clockskew.go
+index 341c5aec..26eac5cf 100644
+--- a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/clockskew.go
++++ b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/clockskew.go
+@@ -65,8 +65,11 @@ type clockSkew struct {
+ 
+ type node struct {
+ 	span     ptrace.Span
++	endParent pcommon.SpanID
+ 	children []*node
+ 	hostKey  string
++	adjusted bool
++	adjustment time.Duration
+ }
+ 
+ // hostKey derives a unique string representation of a host based on resource attributes.
+@@ -106,9 +109,12 @@ func (a *clockSkewAdjuster) buildNodesMap() {
+ 				if _, exists := a.spans[span.SpanID()]; exists {
+ 					jptrace.AddWarnings(span, warningDuplicateSpanID)
+ 				} else {
++					ep, _ := findEndParent(span)
+ 					a.spans[span.SpanID()] = &node{
+ 						span:    span,
++						endParent: ep,
+ 						hostKey: hk,
++						adjusted: false,
+ 					}
+ 				}
+ 			}
+@@ -121,12 +127,20 @@ func (a *clockSkewAdjuster) buildNodesMap() {
+ func (a *clockSkewAdjuster) buildSubGraphs() {
+ 	a.roots = make(map[pcommon.SpanID]*node)
+ 	for _, n := range a.spans {
+-		if n.span.ParentSpanID() == pcommon.NewSpanIDEmpty() {
++		if n.span.ParentSpanID() == pcommon.NewSpanIDEmpty() { //don't consider end parent here, because NULL end parent is a valid case
+ 			a.roots[n.span.SpanID()] = n
+ 			continue
+ 		}
+-		if p, ok := a.spans[n.span.ParentSpanID()]; ok {
+-			p.children = append(p.children, n)
++
++		sp, startParentFound := a.spans[n.span.ParentSpanID()]
++		ep, endParentFound := a.spans[n.endParent]
++
++		// either both start and end parents were found or the start parent was found and the end parent is NULL, both are valid cases
++		if (startParentFound && endParentFound) || (startParentFound && n.endParent.IsEmpty()) {
++			sp.children = append(sp.children, n)
++			if !n.endParent.IsEmpty() {
++				ep.children = append(ep.children, n)
++			}
+ 		} else {
+ 			warning := fmt.Sprintf(warningMissingParentSpanID, n.span.ParentSpanID())
+ 			jptrace.AddWarnings(n.span, warning)
+@@ -136,26 +150,95 @@ func (a *clockSkewAdjuster) buildSubGraphs() {
+ 	}
+ }
+ 
++// checks if the start and end parent haven't been adjusted
++// needed to see if a child should be adjust yet, or shouldn't because one of its parents hasn't been adjusted
++func (a *clockSkewAdjuster) parentsNotAdjusted(spanID pcommon.SpanID) bool {
++	if _, isRoot := a.roots[spanID]; isRoot {
++		return false
++	}
++	startParentID := a.spans[spanID].span.ParentSpanID()
++	endParentID := a.spans[spanID].endParent
++	if endParentID.IsEmpty() {
++		// if end parent is empty, we only consider the start parent for clock skew adjustments
++		endParentID = startParentID
++	}
++
++	if a.spans[startParentID].adjusted == false {
++		return true
++	}
++	if a.spans[endParentID].adjusted == false {
++		return true
++	}
++	return false
++}
++
++// since we consider both start and end parents, need to consider both of these to determine if we can use parent skew in child
++// only do so if the start and end parents have the same host key and the same skew
++// o.w., calculate skew for the child
++func (a *clockSkewAdjuster) useParentSkew(spanID pcommon.SpanID) bool {
++	if _, isRoot := a.roots[spanID]; isRoot {
++		return false
++	}
++	startParentID := a.spans[spanID].span.ParentSpanID()
++	endParentID := a.spans[spanID].endParent
++	if endParentID.IsEmpty() {
++		//invalid span id
++		endParentID = startParentID
++	}
++
++	startParentHostKey := a.spans[startParentID].hostKey
++	endParentHostKey := a.spans[endParentID].hostKey
++
++	startParentSkew := a.spans[startParentID].adjustment
++	endParentSkew := a.spans[endParentID].adjustment
++
++	if startParentHostKey == "" || endParentHostKey == "" {
++		return false
++	}
++
++	if startParentHostKey == endParentHostKey {
++		if startParentHostKey == a.spans[spanID].hostKey {
++			if startParentSkew == endParentSkew {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++
+ func (a *clockSkewAdjuster) adjustNode(n *node, parent *node, skew clockSkew) {
+-	if (n.hostKey != skew.hostKey || n.hostKey == "") && parent != nil {
++	if a.parentsNotAdjusted(n.span.SpanID()) || n.adjusted {
++		return
++	}
++	if (n.hostKey != skew.hostKey || n.hostKey == "" || ((n.span.ParentSpanID() != n.endParent) && a.useParentSkew(n.span.SpanID()) == false)) && parent != nil {
+ 		// Node n is from a different host. The parent has already been adjusted,
+ 		// so we can compare this node's timestamps against the parent.
+ 		skew = clockSkew{
+ 			hostKey: n.hostKey,
+-			delta:   a.calculateSkew(n, parent),
++			delta:   a.calculateSkew(n),
+ 		}
+ 	}
+ 	a.adjustTimestamps(n, skew)
++	n.adjustment = skew.delta
++	n.adjusted = true
++
+ 	for _, child := range n.children {
+ 		a.adjustNode(child, n, skew)
+ 	}
+ }
+ 
+-func (*clockSkewAdjuster) calculateSkew(child *node, parent *node) time.Duration {
+-	parentStartTime := parent.span.StartTimestamp().AsTime()
++func (a *clockSkewAdjuster) calculateSkew(child *node) time.Duration {
++	// updated to consider end parent
++	startParentSpanID := child.span.ParentSpanID()
++	endParentSpanID := child.endParent
++
++	parentStartTime := a.spans[startParentSpanID].span.StartTimestamp().AsTime()
+ 	childStartTime := child.span.StartTimestamp().AsTime()
+-	parentEndTime := parent.span.EndTimestamp().AsTime()
++
++	parentEndTime := a.spans[endParentSpanID].span.EndTimestamp().AsTime()
+ 	childEndTime := child.span.EndTimestamp().AsTime()
++
+ 	parentDuration := parentEndTime.Sub(parentStartTime)
+ 	childDuration := childEndTime.Sub(childStartTime)
+ 
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/clockskew_test.go b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/clockskew_test.go
+index 5613af11..449c109f 100644
+--- a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/clockskew_test.go
++++ b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/clockskew_test.go
+@@ -17,12 +17,13 @@ import (
+ 
+ func TestClockSkewAdjuster(t *testing.T) {
+ 	type testSpan struct {
+-		id, parent          [8]byte
++		id, parent, endParent          [8]byte
+ 		startTime, duration int
+ 		events              []int // timestamps for logs
+ 		host                string
+ 		adjusted            int   // start time after adjustment
+ 		adjustedEvents      []int // adjusted log timestamps
++		diffEndParent bool
+ 	}
+ 
+ 	toTime := func(t int) time.Time {
+@@ -40,6 +41,9 @@ func TestClockSkewAdjuster(t *testing.T) {
+ 			span.SetParentSpanID(spanProto.parent)
+ 			span.SetStartTimestamp(pcommon.NewTimestampFromTime(toTime(spanProto.startTime)))
+ 			span.SetEndTimestamp(pcommon.NewTimestampFromTime(toTime(spanProto.startTime + spanProto.duration)))
++			if spanProto.diffEndParent {
++				addEndParentToSpan(&span, spanProto.endParent)
++			}
+ 
+ 			events := ptrace.NewSpanEventSlice()
+ 			for _, log := range spanProto.events {
+@@ -176,6 +180,24 @@ func TestClockSkewAdjuster(t *testing.T) {
+ 			},
+ 			maxAdjust: time.Second,
+ 		},
++		{
++			description: "span with different start and end parent, no adjustment",
++			trace: []testSpan{
++				{id: [8]byte{1}, parent: [8]byte{0}, startTime: 0, duration: 20, adjusted: 0, diffEndParent: false},
++				{id: [8]byte{2}, parent: [8]byte{0}, startTime: 80, duration: 20, adjusted: 80, diffEndParent: false},
++				{id: [8]byte{3}, parent: [8]byte{1}, endParent: [8]byte{2}, startTime: 10, duration: 80, adjusted: 10, diffEndParent: true},
++			},
++			maxAdjust: time.Second,
++		},
++		{
++			description: "span with different start and end parent and adjustment",
++			trace: []testSpan{
++				{id: [8]byte{1}, parent: [8]byte{0}, startTime: 0, duration: 20, adjusted: 0, diffEndParent: false},
++				{id: [8]byte{2}, parent: [8]byte{0}, startTime: 80, duration: 20, adjusted: 80, diffEndParent: false},
++				{id: [8]byte{3}, parent: [8]byte{1}, endParent: [8]byte{2}, startTime: 50, duration: 80, adjusted: 10, diffEndParent: true},
++			},
++			maxAdjust: time.Second,
++		},
+ 	}
+ 
+ 	for _, tt := range testCases {
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/cpa2_common.go b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/cpa2_common.go
+new file mode 100644
+index 00000000..9075f61f
+--- /dev/null
++++ b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/cpa2_common.go
+@@ -0,0 +1,143 @@
++
++package adjuster
++
++import (
++	"encoding/hex"
++    "encoding/binary"
++	"time"
++	"go.opentelemetry.io/collector/pdata/pcommon"
++	"go.opentelemetry.io/collector/pdata/ptrace"
++	"github.com/jaegertracing/jaeger/internal/telemetry/otelsemconv"
++)
++
++// default value is 0000000000000001, but will be incremented if that is already used in the trace
++func getRootSpanID(spanIDs map[pcommon.SpanID]struct{}) pcommon.SpanID{
++    rootSpanID := pcommon.SpanID([8]byte{0, 0, 0, 0, 0, 0, 0, 1})
++    for true {
++        if _, inSpans := spanIDs[rootSpanID]; !inSpans {
++            return rootSpanID
++        } else {
++            rootSpanID = incrementSpanID(rootSpanID)
++        }
++    }
++
++
++    var rootSpanIDNum uint64
++    rootSpanIDNum = 1
++    for true {
++        var rootSpanIDBytes [8]byte
++        binary.LittleEndian.PutUint64(rootSpanIDBytes[:], rootSpanIDNum)
++        if _, inSpans := spanIDs[rootSpanIDBytes]; !inSpans {
++            return rootSpanIDBytes
++        } else {
++            rootSpanIDNum += 1
++        }
++    }
++    return pcommon.NewSpanIDEmpty()
++}
++
++// returns earliest timestamp
++func getMinTime() pcommon.Timestamp {
++	return pcommon.NewTimestampFromTime(time.Time{})
++}
++
++// not actually max time, but set to the end of 2126, 100 years from now
++func getMaxTime() pcommon.Timestamp {
++	return pcommon.NewTimestampFromTime(time.Date(2126, 12, 31, 23, 59, 59, 999999999, time.UTC))
++}
++
++// get duration by subtracting start timestamp from end timestamp
++func getSpanDuration(span ptrace.Span) time.Duration {
++    return span.EndTimestamp().AsTime().Sub(span.StartTimestamp().AsTime())
++}
++
++// remove an item from the "set" (map with empty structure) and return its key
++func pop(spanIDSet map[pcommon.SpanID]struct{}) pcommon.SpanID {
++    var retID pcommon.SpanID
++    for key := range spanIDSet {
++        retID = key
++        delete(spanIDSet, key)
++        return retID
++    }
++    return pcommon.NewSpanIDEmpty()
++}
++
++// gets service name from resource
++func getServiceName(resource ptrace.ResourceSpans) string {
++    if attr, ok := resource.Resource().Attributes().Get(string(otelsemconv.ServiceNameKey)); ok {
++		return attr.Str()
++	}
++    return ""
++}
++
++// gets host information from resource: returns hostID string, host IPs slice, single host IP string, and host name if any are set
++// (else all are returned empty)
++func getHostInformation(resource ptrace.ResourceSpans) (string, []string, string, string) {
++    hostID := ""
++    hostIPs := []string{}
++    hostIP_string := ""
++    hostName := ""
++
++	if attr, ok := resource.Resource().Attributes().Get(string(otelsemconv.HostIDKey)); ok {
++		hostID = attr.Str()
++	}
++	if attr, ok := resource.Resource().Attributes().Get(string(otelsemconv.HostIPKey)); ok {
++		if attr.Type() == pcommon.ValueTypeStr {
++			hostIP_string = attr.Str()
++		} else if attr.Type() == pcommon.ValueTypeSlice {
++			ips := attr.Slice()
++            for i := 0; i < ips.Len(); i++ {
++                hostIPs[i] = ips.At(i).AsString()
++			}
++		}
++	}
++	if attr, ok := resource.Resource().Attributes().Get(string(otelsemconv.HostNameKey)); ok {
++		hostName = attr.Str()
++	}
++    return hostID, hostIPs, hostIP_string, hostName
++}
++
++// finds end parent attribute if exists and returns the string id stored there as a span id
++// if the end parent attribute is not set, return the id of the start parent
++func findEndParent(span ptrace.Span) (pcommon.SpanID, bool) {
++    spanid_val, found := span.Attributes().Get("end_parent")
++    if found {
++        // convert string to span id
++        spanid_string := spanid_val.AsString()
++        spanid_bytes, _ := hex.DecodeString(spanid_string)
++
++        final_spanid := pcommon.NewSpanIDEmpty()
++        for index, byte := range spanid_bytes {
++            final_spanid[index] = byte
++        }
++        return final_spanid, found
++    }
++
++    return span.ParentSpanID(), found
++}
++
++// add end parent attribute to span
++func addEndParentToSpan(span *ptrace.Span, endParentID pcommon.SpanID) {
++    // convert pcommon.SpanID to []byte{} so hex.EncodeToString can be used
++    endParentID_bytes := []byte{}
++    for _, b := range endParentID {
++        endParentID_bytes = append(endParentID_bytes, b)
++    }
++    span.Attributes().PutStr("end_parent", hex.EncodeToString(endParentID_bytes))
++}
++
++// returns the smaller timestamp of the two
++func minTime(t1 pcommon.Timestamp, t2 pcommon.Timestamp) pcommon.Timestamp {
++    if t1.AsTime().Compare(t2.AsTime()) <= 0 { //if tie, return t1
++        return t1
++    }
++    return t2
++}
++
++// returns the larger timestamp of the two
++func maxTime(t1 pcommon.Timestamp, t2 pcommon.Timestamp) pcommon.Timestamp {
++    if t1.AsTime().Compare(t2.AsTime()) >= 0 { //if tie, return t1
++        return t1
++    }
++    return t2
++}
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/droppedspans.go b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/droppedspans.go
+new file mode 100644
+index 00000000..9ab2d175
+--- /dev/null
++++ b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/droppedspans.go
+@@ -0,0 +1,272 @@
++package adjuster
++
++import (
++	"slices"
++	"go.opentelemetry.io/collector/pdata/pcommon"
++	"go.opentelemetry.io/collector/pdata/ptrace"
++	"github.com/jaegertracing/jaeger/internal/telemetry/otelsemconv"
++)
++
++// SynthesizeDroppedSpans creates an adjuster that synthesizes dropped spans to cover the duration of their children.
++// The synthesized dropped span is attached into the trace as a child of a span that covers its entire duration
++// This is a heuristic, but is intended to improve critical path analysis when spans are dropped as indicated in the CPA2 paper.
++func SynthesizeDroppedSpans(enabled bool) Adjuster {
++	return Func(func(traces ptrace.Traces) {
++		if !enabled {
++			return
++		}
++		adjuster := &droppedSpanAdjuster{
++			traces: traces,
++		}
++		adjuster.buildNodesMap()
++		adjuster.findDroppedSpans()
++	})
++}
++
++type droppedSpanAdjuster struct {
++	traces   ptrace.Traces
++	spans    map[pcommon.SpanID]*dsaNode
++	rootSpan ptrace.Span
++}
++
++type id_and_time struct {
++	ID pcommon.SpanID
++	time pcommon.Timestamp
++}
++
++type dsaNode struct {
++	span     ptrace.Span
++	endParent pcommon.SpanID
++	serviceName string
++	hostID string
++	hostIPs []string
++	hostIPString string
++	hostName string
++	children map[pcommon.SpanID]struct{}
++}
++
++type droppedNode struct {
++	serviceName string
++	startTime pcommon.Timestamp
++	endTime pcommon.Timestamp
++	hostID string
++	hostIPs []string
++	hostIPString string
++	hostName string
++	children map[pcommon.SpanID]struct{}
++}
++
++// buildNodesMap creates a mapping of span IDs to their corresponding nodes.
++func (a *droppedSpanAdjuster) buildNodesMap() {
++	a.spans = make(map[pcommon.SpanID]*dsaNode)
++	resources := a.traces.ResourceSpans()
++	for i := 0; i < resources.Len(); i++ {
++		resource := resources.At(i)
++		serviceName := getServiceName(resource)
++		hostID, hostIPs, hostIPString, hostName := getHostInformation(resource)
++		scopes := resource.ScopeSpans()
++		for j := 0; j < scopes.Len(); j++ {
++			spans := scopes.At(j).Spans()
++			for k := 0; k < spans.Len(); k++ {
++				span := spans.At(k)
++				ep, _ := findEndParent(span)
++				// track host information so that can also be used in dropped parent (if applicable)
++				a.spans[span.SpanID()] = &dsaNode{
++					span:    span,
++					endParent: ep,
++					serviceName: serviceName,
++					hostID: hostID,
++					hostIPs: hostIPs,
++					hostIPString: hostIPString,
++					hostName: hostName,
++					children: make(map[pcommon.SpanID]struct{}),
++				}
++				//check for root span
++				if span.ParentSpanID().IsEmpty() {
++					a.rootSpan = span
++				}
++			}
++		}
++	}
++}
++
++// finds all spans that are dropped and identify their duration to cover their children spans
++// then find a span to attach the synthesized dropped span to that covers its duration
++// pick the "lowest" span in hierarchy by excluding ancestors of candidates that cover the duration of the dropped span
++func (a *droppedSpanAdjuster) findDroppedSpans() {
++	droppedSpans := make(map[pcommon.SpanID]*droppedNode)
++	for spanID, n := range a.spans {
++		if spanID == a.rootSpan.SpanID() {
++			continue
++		}
++		startParent := n.span.ParentSpanID()
++		endParent := n.endParent
++		parents := []id_and_time {
++			{startParent, n.span.StartTimestamp()},
++			{endParent, n.span.EndTimestamp()},
++		}
++
++		// check if the span's start and end parents are in the span nodes map; if not, we assume it was dropped
++		for _, parent := range parents {
++			if parent.ID.IsEmpty() {
++				continue
++			}
++			if _, parentFound := a.spans[parent.ID]; !parentFound {
++				if synthesizedSpan, synthesizedSpanFound := droppedSpans[parent.ID]; !synthesizedSpanFound {
++					//create a span to synthesize the dropped one; actually add to trace later
++					droppedSpans[parent.ID] = &droppedNode{
++						serviceName: n.serviceName,
++						startTime: parent.time,
++						endTime: parent.time,
++						hostID: n.hostID,
++						hostIPs: n.hostIPs,
++						hostIPString: n.hostIPString,
++						hostName: n.hostName,
++						children: make(map[pcommon.SpanID]struct{}),
++					}
++				} else {
++					// extend start and end of synthesized span to cover the duration of its children
++					synthesizedSpan.startTime = min(synthesizedSpan.startTime, parent.time)
++					synthesizedSpan.endTime = max(synthesizedSpan.endTime, parent.time)
++				}
++				droppedSpans[parent.ID].children[spanID] = struct{}{}
++			} else {
++				a.spans[parent.ID].children[spanID] = struct{}{}
++			}
++		}
++	}
++
++	// find parent for dropped spans
++	// iterate from latest end time to earliest to add dropped spans higher in the hierarchy earlier, to handle cases where multiple spans are dropped in the same ancestry line
++	droppedSpanIDs := make([]pcommon.SpanID, 0, len(droppedSpans))
++	for droppedSpanID := range droppedSpans {
++		droppedSpanIDs = append(droppedSpanIDs, droppedSpanID)
++	}
++
++	slices.SortFunc(droppedSpanIDs, func(a,b pcommon.SpanID) int {
++		// compare function will return -1 if a's end time is before b's end time
++		// since we want to sort in descending order, negate compare function's ret val
++		return -droppedSpans[a].endTime.AsTime().Compare(droppedSpans[b].endTime.AsTime())
++	})
++
++	// now that span ids are sorted by reverse end time, use that to move through the map
++	for _, sortedDroppedSpanID := range droppedSpanIDs {
++		droppedSpanNode := droppedSpans[sortedDroppedSpanID]
++		excludedCandidates := make(map[pcommon.SpanID]struct{}) // use map with empty structures as set
++
++		// first, exclude all descendants of the dropped span from being parent candidates
++		descendants := make(map[pcommon.SpanID]struct{})
++		for childSpan := range droppedSpans[sortedDroppedSpanID].children {
++			descendants[childSpan] = struct{}{}
++		}
++
++		for len(descendants) > 0 {
++			currDescendant := pop(descendants)
++			excludedCandidates[currDescendant] = struct{}{}
++			if _, currDescendantInSpans := a.spans[currDescendant]; currDescendantInSpans {
++				for currDescendantChild := range a.spans[currDescendant].children {
++					descendants[currDescendantChild] = struct{}{}
++				}
++			} else if _, currDescendantInDroppedSpans := droppedSpans[currDescendant]; currDescendantInDroppedSpans {
++				for currDescendantChild := range droppedSpans[currDescendant].children {
++					descendants[currDescendantChild] = struct{}{}
++				}
++			}
++		}
++		parentCandidates := make(map[pcommon.SpanID]struct{})
++		for spanID, n := range a.spans {
++			if _, inExcluded := excludedCandidates[spanID]; !inExcluded {
++				// looking for spans that fully cover the synthesized dropped span
++				// exclude the ancestors of these candidates so that we get the "lowest" span in the trace hierarchy-wise that covers the duration of the span.
++				if n.span.StartTimestamp().AsTime().Compare(droppedSpanNode.startTime.AsTime()) <= 0 && droppedSpanNode.endTime.AsTime().Compare(n.span.EndTimestamp().AsTime()) <= 0 {
++					parentCandidates[spanID] = struct{}{}
++					ancestors := make(map[pcommon.SpanID]struct{})
++					ancestors[n.span.ParentSpanID()] = struct{}{}
++					// add end parent to ancestors only if it is not the invalid (empty) span id
++					if !n.endParent.IsEmpty() {
++						ancestors[n.endParent] = struct{}{}
++					}
++					for len(ancestors) > 0 {
++						currAncestor := pop(ancestors)
++						if currAncestor.IsEmpty() {
++							continue
++						}
++
++						if currAncestorNode, currAncestorInSpans := a.spans[currAncestor]; currAncestorInSpans {
++							excludedCandidates[currAncestor] = struct{}{}
++							ancestors[currAncestorNode.span.ParentSpanID()] = struct{}{}
++							if !currAncestorNode.endParent.IsEmpty() {
++								ancestors[currAncestorNode.endParent] = struct{}{}
++							}
++						} else {
++							// exclude spans that do not have an ancestry line to the root
++							excludedCandidates[spanID] = struct{}{}
++							break
++						}
++					}
++				}
++			}
++		}
++		// choose shortest candidate as the parent for the dropped span
++		shortestParent := a.rootSpan.SpanID()
++		shortestDuration := getSpanDuration(a.rootSpan)
++		for parentCandidate := range parentCandidates {
++			if _, parentCandidateInExcluded := excludedCandidates[parentCandidate]; !parentCandidateInExcluded {
++				parentCandidateDuration := getSpanDuration(a.spans[parentCandidate].span)
++				if parentCandidateDuration <= shortestDuration {
++					shortestDuration = parentCandidateDuration
++					shortestParent = parentCandidate
++				}
++			}
++		}
++
++		// add dropped span node to trace with shortest parent as its start and end parent
++		updatedResourceSpans := a.traces.ResourceSpans().AppendEmpty()
++		updatedResourceSpans.Resource().Attributes().PutStr(string(otelsemconv.ServiceNameKey), droppedSpanNode.serviceName)
++		if droppedSpanNode.hostID != "" {
++			updatedResourceSpans.Resource().Attributes().PutStr(string(otelsemconv.HostIDKey), droppedSpanNode.hostID)
++		}
++		if len(droppedSpanNode.hostIPs) > 0 {
++			IPsSlice := updatedResourceSpans.Resource().Attributes().PutEmptySlice(string(otelsemconv.HostIPKey))
++			for _, IP := range droppedSpanNode.hostIPs {
++			   IPsSlice.AppendEmpty().SetStr(IP)
++			}
++		}
++		if droppedSpanNode.hostIPString != "" {
++			updatedResourceSpans.Resource().Attributes().PutStr(string(otelsemconv.HostIPKey), droppedSpanNode.hostIPString)
++		}
++		if droppedSpanNode.hostName != "" {
++			updatedResourceSpans.Resource().Attributes().PutStr(string(otelsemconv.HostIDKey), droppedSpanNode.hostName)
++		}
++
++		scopeSpans := updatedResourceSpans.ScopeSpans().AppendEmpty()
++
++		span := scopeSpans.Spans().AppendEmpty()
++		span.SetTraceID(a.rootSpan.TraceID())
++		span.SetSpanID(sortedDroppedSpanID)
++		span.SetParentSpanID(shortestParent)
++		span.SetName("dropped")
++		span.SetStartTimestamp(droppedSpanNode.startTime)
++		span.SetEndTimestamp(droppedSpanNode.endTime)
++
++		// also create a dsa node for this span, so it can potentially be used as a parent for other dropped spans
++		a.spans[span.SpanID()] = &dsaNode{
++			span:    span,
++			endParent: shortestParent,
++			serviceName: droppedSpanNode.serviceName,
++			hostID: droppedSpanNode.hostID,
++			hostIPs: droppedSpanNode.hostIPs,
++			hostIPString: droppedSpanNode.hostIPString,
++			hostName: droppedSpanNode.hostName,
++			children: make(map[pcommon.SpanID]struct{}),
++		}
++		// copy children
++		for child := range droppedSpanNode.children {
++			a.spans[span.SpanID()].children[child] = struct{}{}
++		}
++
++		// and the dropped span to the children of the shortest parent
++		a.spans[shortestParent].children[span.SpanID()] = struct{}{}
++
++	}
++}
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/droppedspans_test.go b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/droppedspans_test.go
+new file mode 100644
+index 00000000..4c401824
+--- /dev/null
++++ b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/droppedspans_test.go
+@@ -0,0 +1,110 @@
++
++package adjuster
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"go.opentelemetry.io/collector/pdata/pcommon"
++	"go.opentelemetry.io/collector/pdata/ptrace"
++)
++
++func TestDroppedSpanAdjuster(t *testing.T) {
++	type testSpan struct {
++		id, parent          [8]byte
++		startTime, duration int
++	}
++
++	toTime := func(t int) time.Time {
++		return time.Unix(0, (time.Duration(t) * time.Millisecond).Nanoseconds())
++	}
++
++	// helper function that constructs a trace from a list of span prototypes
++	makeTrace := func(spanPrototypes []testSpan) ptrace.Traces {
++		trace := ptrace.NewTraces()
++		for _, spanProto := range spanPrototypes {
++			traceID := pcommon.TraceID([16]byte{0, 0, 0, 0, 0, 0, 0, 1})
++			span := ptrace.NewSpan()
++			span.SetTraceID(traceID)
++			span.SetSpanID(spanProto.id)
++			span.SetParentSpanID(spanProto.parent)
++			span.SetStartTimestamp(pcommon.NewTimestampFromTime(toTime(spanProto.startTime)))
++			span.SetEndTimestamp(pcommon.NewTimestampFromTime(toTime(spanProto.startTime + spanProto.duration)))
++
++			resource := ptrace.NewResourceSpans()
++
++			span.CopyTo(resource.ScopeSpans().AppendEmpty().Spans().AppendEmpty())
++			resource.CopyTo(trace.ResourceSpans().AppendEmpty())
++		}
++		return trace
++	}
++	rootSpanID := [8]byte{0, 0, 0, 0, 0, 0, 0, 1}
++
++	testCases := []struct {
++		description string
++		trace       []testSpan
++		expectedParents map[pcommon.SpanID]pcommon.SpanID
++		expectedStartTimes map[pcommon.SpanID]time.Time
++		expectedEndTimes map[pcommon.SpanID]time.Time
++	}{
++		{
++			description: "single span with dropped parent",
++			trace: []testSpan{
++				{id: [8]byte{2}, parent: [8]byte{1}, startTime: 0, duration: 100},
++			},
++			expectedParents: map[pcommon.SpanID]pcommon.SpanID{rootSpanID: pcommon.NewSpanIDEmpty(), [8]byte{1}:rootSpanID, [8]byte{2}:[8]byte{1},},
++			expectedStartTimes: map[pcommon.SpanID]time.Time{rootSpanID: toTime(0).UTC(), [8]byte{1}: toTime(0).UTC(), [8]byte{2}: toTime(0).UTC()},
++			expectedEndTimes: map[pcommon.SpanID]time.Time{rootSpanID: toTime(100).UTC(), [8]byte{1}: toTime(100).UTC(), [8]byte{2}: toTime(100).UTC()},
++
++		},
++		{
++			description: "two spans with dropped parent",
++			trace: []testSpan{
++				{id: [8]byte{2}, parent: [8]byte{1}, startTime: 0, duration: 100},
++				{id: [8]byte{3}, parent: [8]byte{1}, startTime: 110, duration: 100},
++			},
++			expectedParents: map[pcommon.SpanID]pcommon.SpanID{rootSpanID: pcommon.NewSpanIDEmpty(), [8]byte{1}: rootSpanID, [8]byte{2}: [8]byte{1}, [8]byte{3}: [8]byte{1}},
++			expectedStartTimes: map[pcommon.SpanID]time.Time{rootSpanID: toTime(0).UTC(), [8]byte{1}: toTime(0).UTC(), [8]byte{2}: toTime(0).UTC(), [8]byte{3}: toTime(110).UTC()},
++			expectedEndTimes: map[pcommon.SpanID]time.Time{rootSpanID: toTime(210).UTC(), [8]byte{1}: toTime(210).UTC(), [8]byte{2}: toTime(100).UTC(), [8]byte{3}: toTime(210).UTC()},
++		},
++		{
++			description: "multiple drops",
++			trace: []testSpan{
++				{id: [8]byte{2}, parent: [8]byte{1}, startTime: 0, duration: 100},
++				{id: [8]byte{4}, parent: [8]byte{3}, startTime: 10, duration: 50},
++			},
++			expectedParents: map[pcommon.SpanID]pcommon.SpanID{rootSpanID: pcommon.NewSpanIDEmpty(), [8]byte{1}: rootSpanID, [8]byte{2}: [8]byte{1}, [8]byte{3}: [8]byte{2}, [8]byte{4}: [8]byte{3}},
++			expectedStartTimes: map[pcommon.SpanID]time.Time{rootSpanID: toTime(0).UTC(), [8]byte{1}: toTime(0).UTC(), [8]byte{2}: toTime(0).UTC(), [8]byte{3}: toTime(10).UTC(), [8]byte{4}: toTime(10).UTC()},
++			expectedEndTimes: map[pcommon.SpanID]time.Time{rootSpanID: toTime(100).UTC(), [8]byte{1}: toTime(100).UTC(), [8]byte{2}: toTime(100).UTC(), [8]byte{3}: toTime(60).UTC(), [8]byte{4}: toTime(60).UTC()},
++		},
++	}
++
++	for _, tt := range testCases {
++		testCase := tt // capture loop var
++		t.Run(testCase.description, func(t *testing.T) {
++			trace := makeTrace(testCase.trace)
++			// dropped span adjustments require adding the root span
++			rootSpanAdjuster := AddRootSpan(true)
++			rootSpanAdjuster.Adjust(trace)
++
++			droppedSpanAdjuster := SynthesizeDroppedSpans(true)
++			droppedSpanAdjuster.Adjust(trace)
++
++			resources := trace.ResourceSpans()
++			for i := 0; i < resources.Len(); i++ {
++				resource := resources.At(i)
++				scopes := resource.ScopeSpans()
++				for j := 0; j < scopes.Len(); j++ {
++					spans := scopes.At(j).Spans()
++					for k := 0; k < spans.Len(); k++ {
++						span := spans.At(k)
++						assert.Equal(t, testCase.expectedParents[span.SpanID()], span.ParentSpanID())
++						assert.Equal(t, testCase.expectedStartTimes[span.SpanID()], span.StartTimestamp().AsTime())
++						assert.Equal(t, testCase.expectedEndTimes[span.SpanID()], span.EndTimestamp().AsTime())
++					}
++				}
++			}
++		})
++	}
++}
+\ No newline at end of file
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/fillgapsandextendparents.go b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/fillgapsandextendparents.go
+new file mode 100644
+index 00000000..a9324001
+--- /dev/null
++++ b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/fillgapsandextendparents.go
+@@ -0,0 +1,136 @@
++package adjuster
++
++import (
++	"fmt"
++	"go.opentelemetry.io/collector/pdata/pcommon"
++	"go.opentelemetry.io/collector/pdata/ptrace"
++)
++
++// FillGapsAndExtendParents returns an adjuster that fills gaps that can occur between asynchronous operations and their parents
++// typical Jaeger UI code will drop spans like this that aren't covered by their parent at all
++// this adjustment is an alternative approach that won't omit those spans from the critical path.
++func FillGapsAndExtendParents(enabled bool) Adjuster {
++	return Func(func(traces ptrace.Traces) {
++		if !enabled {
++			return
++		}
++		adjuster := &fillGapsAndExtendAdjuster{
++			traces: traces,
++		}
++		adjuster.buildNodesMap()
++		adjuster.buildChildren()
++		adjuster.adjustParents()
++	})
++}
++
++type fillGapsAndExtendAdjuster struct {
++	traces   ptrace.Traces
++	spans    map[pcommon.SpanID]*fgeNode
++	rootSpan ptrace.Span
++	endParentThreshold int
++}
++
++type fgeNode struct {
++	span     *ptrace.Span
++	endParent pcommon.SpanID
++	children map[pcommon.SpanID]struct{}
++}
++
++// buildNodesMap creates a mapping of span IDs to their corresponding nodes.
++func (a *fillGapsAndExtendAdjuster) buildNodesMap() {
++	a.spans = make(map[pcommon.SpanID]*fgeNode)
++	resources := a.traces.ResourceSpans()
++	for i := 0; i < resources.Len(); i++ {
++		resource := resources.At(i)
++		scopes := resource.ScopeSpans()
++		for j := 0; j < scopes.Len(); j++ {
++			spans := scopes.At(j).Spans()
++			for k := 0; k < spans.Len(); k++ {
++				span := spans.At(k)
++				ep, _ := findEndParent(span)
++				a.spans[span.SpanID()] = &fgeNode{
++					span:    &span,
++					endParent: ep,
++					children: make(map[pcommon.SpanID]struct{}),
++				}
++				//check for root span
++				if span.ParentSpanID().IsEmpty() {
++					a.rootSpan = span
++				}
++			}
++		}
++	}
++}
++
++// buildChildren populates the children set in each node
++func (a *fillGapsAndExtendAdjuster) buildChildren() {
++	for _, n := range a.spans {
++		fmt.Println("span id: ", n.span.SpanID())
++		if n.span.ParentSpanID() == pcommon.NewSpanIDEmpty() { //don't consider end parent here, because NULL end parent is a valid case
++			continue
++		}
++
++		a.spans[n.span.ParentSpanID()].children[n.span.SpanID()] = struct{}{}
++		if !n.endParent.IsEmpty() {
++			a.spans[n.endParent].children[n.span.SpanID()] = struct{}{}
++		}
++	}
++}
++
++
++
++// extend the starts and ends of spans so that there are no gaps between the span and its start and end parent
++// that is, a span's start will always be covered by its start parent
++// and its end will always be covered by its end parent
++func (a *fillGapsAndExtendAdjuster) adjustParents() {
++	modStartTracker := make(map[pcommon.SpanID]pcommon.Timestamp)
++	a.extStart(a.rootSpan.SpanID(), getMaxTime(), modStartTracker)
++
++	modEndTracker := make(map[pcommon.SpanID]pcommon.Timestamp)
++	a.extEnd(a.rootSpan.SpanID(), getMinTime(), modEndTracker)
++
++	for spanID, n := range a.spans {
++		if !n.span.StartTimestamp().AsTime().Equal(modStartTracker[spanID].AsTime()) {
++			n.span.SetStartTimestamp(modStartTracker[spanID])
++		}
++		if !n.span.EndTimestamp().AsTime().Equal(modEndTracker[spanID].AsTime()) {
++			n.span.SetEndTimestamp(modEndTracker[spanID])
++		}
++	}
++
++}
++
++// extend starts of spans (if necessary)
++// first fill gaps from span to its start parent
++// then adjust the start of the span to cover the start of its children, if necessary
++func (a *fillGapsAndExtendAdjuster) extStart(spanID pcommon.SpanID, origParentEnd pcommon.Timestamp, modStartTracker map[pcommon.SpanID]pcommon.Timestamp) pcommon.Timestamp {
++	n := a.spans[spanID]
++	// first, handle gaps
++	modStart := minTime(n.span.StartTimestamp(), origParentEnd)
++	for c := range n.children {
++		// then, recurse through start children.  On way back up, we adjust ourselves to cover their start, if needed.
++		if a.spans[c].span.ParentSpanID() == spanID {
++			modStart = minTime(modStart, a.extStart(c, n.span.EndTimestamp(), modStartTracker))
++		}
++	}
++	modStartTracker[spanID] = modStart
++	return modStart
++}
++
++// extend ends of spans (if necessary)
++// first fill gaps from span to its end parent
++// then adjust the end of the span to cover the end of its children, if necessary
++func (a *fillGapsAndExtendAdjuster) extEnd(spanID pcommon.SpanID, origParentStart pcommon.Timestamp, modEndTracker map[pcommon.SpanID]pcommon.Timestamp) pcommon.Timestamp {
++	n := a.spans[spanID]
++	modEnd := maxTime(n.span.EndTimestamp(), origParentStart)
++	for c := range n.children {
++		if a.spans[c].endParent == spanID {
++			modEnd = maxTime(modEnd, a.extEnd(c, n.span.StartTimestamp(), modEndTracker))
++		} else if a.spans[c].endParent == pcommon.NewSpanIDEmpty() {
++			// if the end parent of the child is invalid, don't worry about adjusting this span to cover the end of the child
++			a.extEnd(c, n.span.StartTimestamp(), modEndTracker)
++		}
++	}
++	modEndTracker[spanID] = modEnd
++	return modEnd
++}
+\ No newline at end of file
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/fillgapsandextendparents_test.go b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/fillgapsandextendparents_test.go
+new file mode 100644
+index 00000000..db6de0bf
+--- /dev/null
++++ b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/fillgapsandextendparents_test.go
+@@ -0,0 +1,112 @@
++
++package adjuster
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"go.opentelemetry.io/collector/pdata/pcommon"
++	"go.opentelemetry.io/collector/pdata/ptrace"
++)
++
++func TestFillGapsAndExtendAdjuster(t *testing.T) {
++	type testSpan struct {
++		id, parent, endParent [8]byte
++		startTime, duration int
++	}
++
++	toTime := func(t int) time.Time {
++		return time.Unix(0, (time.Duration(t) * time.Millisecond).Nanoseconds())
++	}
++
++	// helper function that constructs a trace from a list of span prototypes
++	makeTrace := func(spanPrototypes []testSpan) ptrace.Traces {
++		trace := ptrace.NewTraces()
++		for _, spanProto := range spanPrototypes {
++			traceID := pcommon.TraceID([16]byte{0, 0, 0, 0, 0, 0, 0, 1})
++			span := ptrace.NewSpan()
++			span.SetTraceID(traceID)
++			span.SetSpanID(spanProto.id)
++			span.SetParentSpanID(spanProto.parent)
++			span.SetStartTimestamp(pcommon.NewTimestampFromTime(toTime(spanProto.startTime)))
++			span.SetEndTimestamp(pcommon.NewTimestampFromTime(toTime(spanProto.startTime + spanProto.duration)))
++			if spanProto.endParent != spanProto.parent {
++				addEndParentToSpan(&span, spanProto.endParent)
++			}
++			resource := ptrace.NewResourceSpans()
++
++			span.CopyTo(resource.ScopeSpans().AppendEmpty().Spans().AppendEmpty())
++			resource.CopyTo(trace.ResourceSpans().AppendEmpty())
++		}
++		return trace
++	}
++	rootSpanID := [8]byte{0, 0, 0, 0, 0, 0, 0, 1}
++
++	testCases := []struct {
++		description string
++		trace       []testSpan
++		expectedStartTimes map[pcommon.SpanID]time.Time
++		expectedEndTimes map[pcommon.SpanID]time.Time
++	}{
++		{
++			description: "async operation with end parent same as start parent",
++			trace: []testSpan{
++				{id: [8]byte{1}, parent: [8]byte{0}, endParent: [8]byte{0}, startTime: 0, duration: 100},
++				{id: [8]byte{2}, parent: [8]byte{1}, endParent: [8]byte{1}, startTime: 10, duration: 20},
++				{id: [8]byte{3}, parent: [8]byte{2}, endParent: [8]byte{2}, startTime: 30, duration: 50},
++			},
++			expectedStartTimes: map[pcommon.SpanID]time.Time{rootSpanID: toTime(0).UTC(), [8]byte{1}: toTime(0).UTC(), [8]byte{2}: toTime(10).UTC(), [8]byte{3}: toTime(30).UTC()},
++			expectedEndTimes: map[pcommon.SpanID]time.Time{rootSpanID: toTime(100).UTC(), [8]byte{1}: toTime(100).UTC(), [8]byte{2}: toTime(80).UTC(), [8]byte{3}: toTime(80).UTC()},
++
++		},
++		{
++			description: "async operation with different end parent",
++			trace: []testSpan{
++				{id: [8]byte{1}, parent: [8]byte{0}, endParent: [8]byte{0}, startTime: 0, duration: 100},
++				{id: [8]byte{2}, parent: [8]byte{1}, endParent: [8]byte{1}, startTime: 10, duration: 10},
++				{id: [8]byte{3}, parent: [8]byte{1}, endParent: [8]byte{1}, startTime: 70, duration: 20},
++				{id: [8]byte{4}, parent: [8]byte{2}, endParent: [8]byte{3}, startTime: 30, duration: 50}, //start will be extended back to 20 to fill the gap
++			},
++			expectedStartTimes: map[pcommon.SpanID]time.Time{rootSpanID: toTime(0).UTC(), [8]byte{1}: toTime(0).UTC(), [8]byte{2}: toTime(10).UTC(), [8]byte{3}: toTime(70).UTC(), [8]byte{4}: toTime(20).UTC()},
++			expectedEndTimes: map[pcommon.SpanID]time.Time{rootSpanID: toTime(100).UTC(), [8]byte{1}: toTime(100).UTC(), [8]byte{2}: toTime(20).UTC(), [8]byte{3}: toTime(90).UTC(), [8]byte{4}: toTime(80).UTC()},
++		},
++		{
++			description: "async operation with NULL end parent",
++			trace: []testSpan{
++				{id: [8]byte{1}, parent: [8]byte{0}, endParent: [8]byte{0}, startTime: 0, duration: 100},
++				{id: [8]byte{2}, parent: [8]byte{1}, endParent: [8]byte{1}, startTime: 10, duration: 10},
++				{id: [8]byte{3}, parent: [8]byte{2}, endParent: [8]byte{0}, startTime: 30, duration: 50}, //start will be extended back to 20 to fill the gap
++			},
++			expectedStartTimes: map[pcommon.SpanID]time.Time{rootSpanID: toTime(0).UTC(), [8]byte{1}: toTime(0).UTC(), [8]byte{2}: toTime(10).UTC(), [8]byte{3}: toTime(20).UTC()},
++			expectedEndTimes: map[pcommon.SpanID]time.Time{rootSpanID: toTime(100).UTC(), [8]byte{1}: toTime(100).UTC(), [8]byte{2}: toTime(20).UTC(), [8]byte{3}: toTime(80).UTC()},
++		},
++	}
++
++	for _, tt := range testCases {
++		testCase := tt // capture loop var
++		t.Run(testCase.description, func(t *testing.T) {
++			trace := makeTrace(testCase.trace)
++			//dropped span adjustments require adding the root span
++			rootSpanAdjuster := AddRootSpan(true)
++			rootSpanAdjuster.Adjust(trace)
++
++			droppedSpanAdjuster := FillGapsAndExtendParents(true)
++			droppedSpanAdjuster.Adjust(trace)
++
++			resources := trace.ResourceSpans()
++			for i := 0; i < resources.Len(); i++ {
++				resource := resources.At(i)
++				scopes := resource.ScopeSpans()
++				for j := 0; j < scopes.Len(); j++ {
++					spans := scopes.At(j).Spans()
++					for k := 0; k < spans.Len(); k++ {
++						span := spans.At(k)
++						assert.Equal(t, testCase.expectedStartTimes[span.SpanID()], span.StartTimestamp().AsTime())
++						assert.Equal(t, testCase.expectedEndTimes[span.SpanID()], span.EndTimestamp().AsTime())
++					}
++				}
++			}
++		})
++	}
++}
+\ No newline at end of file
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/spaniduniquifier.go b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/spaniduniquifier.go
+index 687fea06..852a6946 100644
+--- a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/spaniduniquifier.go
++++ b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/spaniduniquifier.go
+@@ -122,6 +122,14 @@ func (*spanIDDeduper) swapParentIDs(
+ 						span.SetParentSpanID(parentID)
+ 					}
+ 				}
++				//added to also update end parent attribute in spans that have the uniquified server spans as their end parent
++				if ep, found := findEndParent(span); found {
++					if newEndParentID, ok := oldToNewSpanIDs[ep]; ok {
++						if span.SpanID() != ep {
++							addEndParentToSpan(&span, newEndParentID)
++						}
++					}
++				}
+ 			}
+ 		}
+ 	}
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/spaniduniquifier_test.go b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/spaniduniquifier_test.go
+index 3c426b20..04751a70 100644
+--- a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/spaniduniquifier_test.go
++++ b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/spaniduniquifier_test.go
+@@ -18,11 +18,11 @@ import (
+ var (
+ 	clientSpanID  = pcommon.SpanID([]byte{0, 0, 0, 0, 0, 0, 0, 1})
+ 	anotherSpanID = pcommon.SpanID([]byte{1, 0, 0, 0, 0, 0, 0, 0})
++	yetAnotherSpanID = pcommon.SpanID([]byte{0, 0, 0, 0, 0, 0, 0, 2})
++	traceID = pcommon.TraceID([]byte{0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3})
+ )
+ 
+ func makeTraces() ptrace.Traces {
+-	traceID := pcommon.TraceID([]byte{0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3})
+-
+ 	traces := ptrace.NewTraces()
+ 	spans := traces.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans()
+ 
+@@ -102,3 +102,43 @@ func TestSpanIDUniquifierError(t *testing.T) {
+ 	warnings := jptrace.GetWarnings(span)
+ 	require.Equal(t, []string{"cannot assign unique span ID, too many spans in the trace"}, warnings)
+ }
++
++func TestSpanIDUniquifierEndParentUpdated(t *testing.T) {
++	traces := makeTraces()
++
++	//add another span with server as end parent
++	spans := traces.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
++
++	yetAnotherSpan := spans.AppendEmpty()
++	yetAnotherSpan.SetTraceID(traceID)
++	yetAnotherSpan.SetSpanID(yetAnotherSpanID)
++	yetAnotherSpan.SetParentSpanID(anotherSpanID)
++	//times aren't specified here, but the idea is that this could be an asynchonous operation that has the third span above as its start parent
++	//and the server span as its end parent
++	addEndParentToSpan(&yetAnotherSpan, clientSpanID)
++
++	deduper := DeduplicateClientServerSpanIDs()
++	deduper.Adjust(traces)
++
++	//same as first test from above
++	clientSpan := spans.At(0)
++	assert.Equal(t, clientSpanID, clientSpan.SpanID(), "client span ID should not change")
++
++	serverSpan := spans.At(1)
++	assert.EqualValues(t, []byte{0, 0, 0, 0, 0, 0, 0, 3}, serverSpan.SpanID(), "server span ID should be reassigned")
++	assert.Equal(t, clientSpanID, serverSpan.ParentSpanID(), "next server span should be this server span's parent")
++
++	thirdSpan := spans.At(2)
++	assert.Equal(t, anotherSpanID, thirdSpan.SpanID(), "3rd span ID should not change")
++	assert.Equal(t, serverSpan.SpanID(), thirdSpan.ParentSpanID(), "parent of 3rd span should change to new spanID")
++
++	//new, to test that the end parent is updated
++	fourthSpan := spans.At(3)
++	assert.Equal(t, yetAnotherSpanID, fourthSpan.SpanID(), "4th span ID should not change")
++	assert.Equal(t, thirdSpan.SpanID(), fourthSpan.ParentSpanID(), "parent of 4th span should not change")
++	if ep, found := findEndParent(fourthSpan); !found {
++		assert.Fail(t, "4th span should have an end parent attribute")
++	} else {
++		assert.Equal(t, ep, serverSpan.SpanID(), "end parent of 4th span should change to new spanID")
++	}
++}
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/standard.go b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/standard.go
+index cfbb8915..1491dbb7 100644
+--- a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/standard.go
++++ b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/standard.go
+@@ -9,13 +9,18 @@ import (
+ 
+ // StandardAdjusters returns a list of adjusters applied by the query service
+ // before returning the data to the API clients.
+-func StandardAdjusters(maxClockSkewAdjust time.Duration) []Adjuster {
++func StandardAdjusters(addRootSpanEnabled bool, synthesizeDroppedSpansEnabled bool, fillGapsAndExtendParentsEnabled bool, maxClockSkewAdjust time.Duration) []Adjuster {
+ 	return []Adjuster{
++		AddRootSpan(addRootSpanEnabled),
+ 		DeduplicateClientServerSpanIDs(),
+ 		SortCollections(),
+ 		// DeduplicateSpans depends on SortCollections running first
+ 		DeduplicateSpans(),
++		// SynthesizeDroppedSpans depends on adding root span
++		SynthesizeDroppedSpans(synthesizeDroppedSpansEnabled),
+ 		CorrectClockSkew(maxClockSkewAdjust),
++		// FillGapsAndExtendParents depends on adding root span
++		FillGapsAndExtendParents(fillGapsAndExtendParentsEnabled),
+ 		NormalizeIPAttributes(),
+ 		MoveLibraryAttributes(),
+ 		RemoveEmptySpanLinks(),
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/standard_test.go b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/standard_test.go
+index d2fadfe2..8042a137 100644
+--- a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/standard_test.go
++++ b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/standard_test.go
+@@ -12,14 +12,20 @@ import (
+ 
+ func TestStandardAdjusters(t *testing.T) {
+ 	maxClockSkewAdjust := 10 * time.Second
+-	adjusters := StandardAdjusters(maxClockSkewAdjust)
+-
+-	assert.Len(t, adjusters, 7, "Expected 7 adjusters")
+-	assert.IsType(t, DeduplicateClientServerSpanIDs(), adjusters[0])
+-	assert.IsType(t, SortCollections(), adjusters[1])
+-	assert.IsType(t, DeduplicateSpans(), adjusters[2])
+-	assert.IsType(t, CorrectClockSkew(maxClockSkewAdjust), adjusters[3])
+-	assert.IsType(t, NormalizeIPAttributes(), adjusters[4])
+-	assert.IsType(t, MoveLibraryAttributes(), adjusters[5])
+-	assert.IsType(t, RemoveEmptySpanLinks(), adjusters[6])
++	addRootSpanEnabled := true
++	synthesizeDroppedSpansEnabled := true
++	fillGapsAndExtendParentsEnabled := true
++	adjusters := StandardAdjusters(addRootSpanEnabled, synthesizeDroppedSpansEnabled, fillGapsAndExtendParentsEnabled, maxClockSkewAdjust)
++	//TODO: update with number of adjusters
++	assert.Len(t, adjusters, 10, "Expected 10 adjusters")
++	assert.IsType(t, AddRootSpan(addRootSpanEnabled), adjusters[0])
++	assert.IsType(t, DeduplicateClientServerSpanIDs(), adjusters[1])
++	assert.IsType(t, SortCollections(), adjusters[2])
++	assert.IsType(t, DeduplicateSpans(), adjusters[3])
++	assert.IsType(t, SynthesizeDroppedSpans(synthesizeDroppedSpansEnabled), adjusters[4])
++	assert.IsType(t, CorrectClockSkew(maxClockSkewAdjust), adjusters[5])
++	assert.IsType(t, FillGapsAndExtendParents(fillGapsAndExtendParentsEnabled), adjusters[6])
++	assert.IsType(t, NormalizeIPAttributes(), adjusters[7])
++	assert.IsType(t, MoveLibraryAttributes(), adjusters[8])
++	assert.IsType(t, RemoveEmptySpanLinks(), adjusters[9])
+ }
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/internal/flags.go b/cmd/jaeger/internal/extension/jaegerquery/internal/flags.go
+index 6627daa5..55e7e544 100644
+--- a/cmd/jaeger/internal/extension/jaegerquery/internal/flags.go
++++ b/cmd/jaeger/internal/extension/jaegerquery/internal/flags.go
+@@ -334,11 +334,20 @@ type QueryOptions struct {
+ 	AI configoptional.Optional[AIConfig] `mapstructure:"ai"`
+ 	// OTLPProxy, when present, mounts an OTLP HTTP reverse proxy — see OTLPProxyConfig.
+ 	OTLPProxy configoptional.Optional[OTLPProxyConfig] `mapstructure:"otlp_proxy"`
++	// add ROOT span to trace
++	AddRootSpan bool `mapstructure:"add_root_span"`
++	// use dropped span heuristic to synthesize detectable dropped spans
++	DroppedSpanSupport bool `mapstructure:"dropped_span_support"`
++	// fill in gaps and extend end parents
++	FillGapsExtendParents bool `mapstructure:"fill_gaps_extend_parents"`
+ }
+ 
+ func DefaultQueryOptions() QueryOptions {
+ 	return QueryOptions{
+ 		MaxClockSkewAdjust: 0, // disabled by default
++		AddRootSpan: false, // disabled by default
++		DroppedSpanSupport: false, //disabled by default
++		FillGapsExtendParents: false, //disabled by default
+ 		AI: configoptional.Default(AIConfig{
+ 			AgentURL:            DefaultAIAgentURL,
+ 			MaxRequestBodySize:  DefaultAIMaxRequestBodySize,
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/querysvc/service.go b/cmd/jaeger/internal/extension/jaegerquery/querysvc/service.go
+index 6f769bcf..3db5a4b3 100644
+--- a/cmd/jaeger/internal/extension/jaegerquery/querysvc/service.go
++++ b/cmd/jaeger/internal/extension/jaegerquery/querysvc/service.go
+@@ -47,6 +47,12 @@ type QueryServiceOptions struct {
+ 	// it named them. The query service invokes their OnTraceQuery around every trace search and their
+ 	// OnTraceResult around every batch of loaded traces. Most deployments configure none.
+ 	Interceptors []queryinterceptor.Interceptor
++	// add ROOT span to trace
++	AddRootSpan bool
++	// use dropped span heuristic to synthesize detectable dropped spans
++	DroppedSpanSupport bool
++	// fill in gaps and extend end parents
++	FillGapsExtendParents bool
+ }
+ 
+ // QueryService provides methods to query data from the storage.
+@@ -135,7 +141,7 @@ func NewQueryService(
+ 		traceReader:      traceReader,
+ 		dependencyReader: dependencyReader,
+ 		adjuster: adjuster.Sequence(
+-			adjuster.StandardAdjusters(options.MaxClockSkewAdjust)...,
++			adjuster.StandardAdjusters(options.AddRootSpan, options.DroppedSpanSupport, options.FillGapsExtendParents, options.MaxClockSkewAdjust)...,
+ 		),
+ 		options: options,
+ 	}
+diff --git a/cmd/jaeger/internal/extension/jaegerquery/server.go b/cmd/jaeger/internal/extension/jaegerquery/server.go
+index 265cbb17..7c86aceb 100644
+--- a/cmd/jaeger/internal/extension/jaegerquery/server.go
++++ b/cmd/jaeger/internal/extension/jaegerquery/server.go
+@@ -95,6 +95,8 @@ func (s *server) Start(ctx context.Context, host component.Host) error {
+ 	opts := querysvc.QueryServiceOptions{
+ 		MaxClockSkewAdjust: s.config.MaxClockSkewAdjust,
+ 		MaxTraceSize:       s.config.MaxTraceSize,
++		AddRootSpan: s.config.AddRootSpan,
++		DroppedSpanSupport: s.config.DroppedSpanSupport,
+ 		Interceptors:       interceptors,
+ 	}
+ 	if err := s.addArchiveStorage(&opts, host); err != nil {

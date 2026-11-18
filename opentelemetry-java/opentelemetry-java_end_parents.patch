@@ -1,0 +1,562 @@
+diff --git a/bd.sh b/bd.sh
+new file mode 100644
+index 0000000000..e1e1e5ffde
+--- /dev/null
++++ b/bd.sh
+@@ -0,0 +1,3 @@
++export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64/ 
++./gradlew :javaagent:shadowJar -x test -x check --no-daemon --no-build-cache
++
+diff --git a/conventions/src/main/kotlin/otel.java-conventions.gradle.kts b/conventions/src/main/kotlin/otel.java-conventions.gradle.kts
+index 4a04f2e6c3..2941483ad7 100644
+--- a/conventions/src/main/kotlin/otel.java-conventions.gradle.kts
++++ b/conventions/src/main/kotlin/otel.java-conventions.gradle.kts
+@@ -71,7 +71,7 @@ tasks.withType<JavaCompile>().configureEach {
+           "-Xlint:-options",
+ 
+           // Fail build on any warning
+-          "-Werror"
++          // "-Werror"
+         )
+       )
+     }
+diff --git a/gradle.properties b/gradle.properties
+index a25acd4da9..f261159dd7 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -1,5 +1,5 @@
+ org.gradle.parallel=true
+-org.gradle.caching=true
++org.gradle.caching=false
+ 
+ org.gradle.priority=low
+ 
+@@ -24,3 +24,6 @@ systemProp.org.gradle.internal.http.connectionTimeout=120000
+ systemProp.org.gradle.internal.http.socketTimeout=120000
+ systemProp.org.gradle.internal.repository.max.retries=10
+ systemProp.org.gradle.internal.repository.initial.backoff=500
++org.gradle.java.installations.paths=/usr/lib/jvm/java-11-openjdk-amd64
++org.gradle.java.installations.auto-detect=false
++
+diff --git a/instrumentation-api/src/main/java/io/opentelemetry/instrumentation/api/instrumenter/Instrumenter.java b/instrumentation-api/src/main/java/io/opentelemetry/instrumentation/api/instrumenter/Instrumenter.java
+index 430a93a67f..11671ed76d 100644
+--- a/instrumentation-api/src/main/java/io/opentelemetry/instrumentation/api/instrumenter/Instrumenter.java
++++ b/instrumentation-api/src/main/java/io/opentelemetry/instrumentation/api/instrumenter/Instrumenter.java
+@@ -11,6 +11,7 @@ import io.opentelemetry.api.trace.SpanBuilder;
+ import io.opentelemetry.api.trace.SpanKind;
+ import io.opentelemetry.api.trace.Tracer;
+ import io.opentelemetry.context.Context;
++import io.opentelemetry.instrumentation.api.internal.EndParentTracker;
+ import io.opentelemetry.instrumentation.api.internal.SupportabilityMetrics;
+ import java.time.Instant;
+ import java.util.ArrayList;
+@@ -237,6 +238,8 @@ public class Instrumenter<REQUEST, RESPONSE> {
+     SpanStatusBuilder spanStatusBuilder = new SpanStatusBuilderImpl(span);
+     spanStatusExtractor.extract(spanStatusBuilder, request, response, error);
+ 
++    EndParentTracker.onEnding(span);
++
+     if (endTime != null) {
+       span.end(endTime);
+     } else {
+diff --git a/instrumentation-api/src/main/java/io/opentelemetry/instrumentation/api/internal/EndParentTracker.java b/instrumentation-api/src/main/java/io/opentelemetry/instrumentation/api/internal/EndParentTracker.java
+new file mode 100644
+index 0000000000..45517b1aef
+--- /dev/null
++++ b/instrumentation-api/src/main/java/io/opentelemetry/instrumentation/api/internal/EndParentTracker.java
+@@ -0,0 +1,89 @@
++/*
++ * Copyright The OpenTelemetry Authors
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++package io.opentelemetry.instrumentation.api.internal;
++
++import io.opentelemetry.api.trace.Span;
++import io.opentelemetry.api.trace.SpanContext;
++import io.opentelemetry.context.Context;
++import io.opentelemetry.context.ContextStorage;
++import io.opentelemetry.context.Scope;
++import java.util.ArrayDeque;
++import java.util.function.Function;
++import javax.annotation.Nullable;
++
++/**
++ * Adds the "end_parent" attribute to a span when the span that is active when it ends differs from
++ * its start parent. Mirrors Span::End() of the opentelemetry-cpp end parent patch.
++ *
++ * <p>This class is internal and is hence not for public use. Its APIs are unstable and can change
++ * at any time.
++ */
++public final class EndParentTracker {
++
++  // returns the start parent of an SDK span; set by the agent, which can see the SDK classes
++  private static volatile Function<Span, SpanContext> parentLookup = span -> null;
++  // per-thread stack of attached contexts (C++: ThreadLocalContextStorage's stack)
++  private static final ThreadLocal<ArrayDeque<Context>> contextStack =
++      ThreadLocal.withInitial(ArrayDeque::new);
++
++  public static void setParentLookup(Function<Span, SpanContext> lookup) {
++    parentLookup = lookup;
++  }
++
++  /** Called right before {@code span.end()}. */
++  public static void onEnding(Span span) {
++    SpanContext parent = parentLookup.apply(span);
++    // remote parents are skipped: in the C++ traces, spans with a remote parent never get one
++    if (parent == null || parent.isRemote()) {
++      return;
++    }
++    String active = Span.current().getSpanContext().getSpanId();
++    // if the span being ended is still active, use the next context in the stack
++    if (active.equals(span.getSpanContext().getSpanId())) {
++      active = topNext();
++    }
++    if (!active.equals(parent.getSpanId())) {
++      span.setAttribute("end_parent", active);
++    }
++  }
++
++  // C++: RuntimeContext::GetCurrentParent() -> Stack::TopNext()
++  private static String topNext() {
++    Context next = null;
++    int i = 0;
++    for (Context context : contextStack.get()) { // iterates from the top of the stack
++      if (i++ == 1) {
++        next = context;
++        break;
++      }
++    }
++    return Span.fromContext(next == null ? Context.root() : next).getSpanContext().getSpanId();
++  }
++
++  /** Wraps the context storage so that attached contexts are also kept on a stack. */
++  public static ContextStorage wrapContextStorage(ContextStorage delegate) {
++    return new ContextStorage() {
++      @Override
++      public Scope attach(Context toAttach) {
++        Scope scope = delegate.attach(toAttach);
++        ArrayDeque<Context> stack = contextStack.get();
++        stack.push(toAttach);
++        return () -> {
++          stack.removeFirstOccurrence(toAttach);
++          scope.close();
++        };
++      }
++
++      @Nullable
++      @Override
++      public Context current() {
++        return delegate.current();
++      }
++    };
++  }
++
++  private EndParentTracker() {}
++}
+diff --git a/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/AsyncRunnableInstrumenter.java b/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/AsyncRunnableInstrumenter.java
+new file mode 100644
+index 0000000000..f8ecad2fdf
+--- /dev/null
++++ b/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/AsyncRunnableInstrumenter.java
+@@ -0,0 +1,43 @@
++package io.opentelemetry.javaagent.instrumentation.executors;
++
++import io.opentelemetry.api.GlobalOpenTelemetry;
++import io.opentelemetry.instrumentation.api.instrumenter.Instrumenter;
++import io.opentelemetry.instrumentation.api.instrumenter.SpanKindExtractor;
++import io.opentelemetry.instrumentation.api.instrumenter.code.CodeAttributesExtractor;
++import io.opentelemetry.instrumentation.api.instrumenter.code.CodeAttributesGetter;
++import io.opentelemetry.instrumentation.api.instrumenter.code.CodeSpanNameExtractor;
++
++public class AsyncRunnableInstrumenter {
++
++  private static final String INSTRUMENTATION_NAME = "async";
++
++  private static final Instrumenter<Runnable, Void> INSTRUMENTER;
++
++  static {
++      CodeAttributesGetter<Runnable> codeGetter = new CodeAttributesGetter<Runnable>() {
++        @Override
++        public Class<?> getCodeClass(Runnable runnable) {
++          return runnable.getClass();
++        }
++
++        @Override
++        public String getMethodName(Runnable runnable) {
++          return "run";
++        }
++      };
++
++    INSTRUMENTER =
++        Instrumenter.<Runnable, Void>builder(
++                GlobalOpenTelemetry.get(),
++                INSTRUMENTATION_NAME,
++                CodeSpanNameExtractor.create(codeGetter))
++            .addAttributesExtractor(CodeAttributesExtractor.create(codeGetter))
++            .buildInstrumenter(SpanKindExtractor.alwaysInternal());
++  }
++
++  public static Instrumenter<Runnable, Void> instrumenter() {
++    return INSTRUMENTER;
++  }
++
++  private AsyncRunnableInstrumenter() {}
++}
+diff --git a/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/CallableInstrumentation.java b/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/CallableInstrumentation.java
+index b511730da8..41dcc6d10b 100644
+--- a/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/CallableInstrumentation.java
++++ b/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/CallableInstrumentation.java
+@@ -21,6 +21,9 @@ import net.bytebuddy.asm.Advice;
+ import net.bytebuddy.description.type.TypeDescription;
+ import net.bytebuddy.matcher.ElementMatcher;
+ 
++// import io.opentelemetry.instrumentation.api.instrumenter.Instrumenter;
++// import io.opentelemetry.javaagent.bootstrap.Java8BytecodeBridge;
++// import io.opentelemetry.context.Context;
+ public class CallableInstrumentation implements TypeInstrumentation {
+ 
+   @Override
+@@ -42,6 +45,20 @@ public class CallableInstrumentation implements TypeInstrumentation {
+     public static Scope enter(@Advice.This Callable<?> task) {
+       VirtualField<Callable<?>, PropagatedContext> virtualField =
+           VirtualField.find(Callable.class, PropagatedContext.class);
++
++      // System.out.println(Thread.currentThread().getName()+":!!! In enter() " + task +", " + Java8BytecodeBridge.currentSpan());
++      // Scope ctx = TaskAdviceHelper.makePropagatedContextCurrent(virtualField, task);
++      // if(ctx == null) {
++      //   return null;
++      // }
++
++      // Context parentContext = Java8BytecodeBridge.currentContext();
++      // Instrumenter<Callable<?>, Void> INSTRUMENTER = AsyncCallableInstrumenter.instrumenter();
++      // if (!INSTRUMENTER.shouldStart(parentContext, task)) {
++      //   return null;
++      // }
++      // Context newer = INSTRUMENTER.start(parentContext, task);
++      // return newer.makeCurrent();
+       return TaskAdviceHelper.makePropagatedContextCurrent(virtualField, task);
+     }
+ 
+diff --git a/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/ExecutorInstrumentationModule.java b/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/ExecutorInstrumentationModule.java
+index 7e022170b0..4f06890a9d 100644
+--- a/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/ExecutorInstrumentationModule.java
++++ b/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/ExecutorInstrumentationModule.java
+@@ -12,12 +12,22 @@ import io.opentelemetry.javaagent.extension.instrumentation.InstrumentationModul
+ import io.opentelemetry.javaagent.extension.instrumentation.TypeInstrumentation;
+ import java.util.List;
+ 
++import java.util.ArrayList;
++import java.util.Arrays;
++
+ @AutoService(InstrumentationModule.class)
+ public class ExecutorInstrumentationModule extends InstrumentationModule {
+   public ExecutorInstrumentationModule() {
+     super("executor");
+   }
+ 
++  @Override
++  public List<String> getAdditionalHelperClassNames() {
++      return Arrays.asList(
++        "io.opentelemetry.javaagent.instrumentation.executors.AsyncRunnableInstrumenter"
++      );
++  }
++
+   @Override
+   public List<TypeInstrumentation> typeInstrumentations() {
+     return asList(
+diff --git a/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/FutureGetInstrumenter.java b/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/FutureGetInstrumenter.java
+new file mode 100644
+index 0000000000..bd2272f021
+--- /dev/null
++++ b/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/FutureGetInstrumenter.java
+@@ -0,0 +1,44 @@
++
++package io.opentelemetry.javaagent.instrumentation.executors;
++
++import io.opentelemetry.api.GlobalOpenTelemetry;
++import io.opentelemetry.instrumentation.api.instrumenter.Instrumenter;
++import io.opentelemetry.instrumentation.api.instrumenter.SpanKindExtractor;
++import io.opentelemetry.instrumentation.api.instrumenter.code.CodeAttributesExtractor;
++import io.opentelemetry.instrumentation.api.instrumenter.code.CodeAttributesGetter;
++import io.opentelemetry.instrumentation.api.instrumenter.code.CodeSpanNameExtractor;
++import java.util.concurrent.Future;
++public final class FutureGetInstrumenter {
++  private static final String INSTRUMENTATION_NAME = "future-get";
++
++  private static final Instrumenter<Future<?>, Void> INSTRUMENTER;
++
++  static {
++      CodeAttributesGetter<Future<?>> codeGetter = new CodeAttributesGetter<Future<?>>() {
++        @Override
++        public Class<?> getCodeClass(Future<?> runnable) {
++          return runnable.getClass();
++        }
++
++        @Override
++        public String getMethodName(Future<?> runnable) {
++          return "get";
++        }
++      };
++
++    INSTRUMENTER =
++        Instrumenter.<Future<?>, Void>builder(
++                GlobalOpenTelemetry.get(),
++                INSTRUMENTATION_NAME,
++                CodeSpanNameExtractor.create(codeGetter))
++            .addAttributesExtractor(CodeAttributesExtractor.create(codeGetter))
++            .buildInstrumenter(SpanKindExtractor.alwaysInternal());
++  }
++
++  public static Instrumenter<Future<?>, Void> instrumenter() {
++    return INSTRUMENTER;
++  }
++
++  private FutureGetInstrumenter() {}
++
++}
+diff --git a/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/FutureInstrumentation.java b/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/FutureInstrumentation.java
+index c2dce950fa..0b9d637dd9 100644
+--- a/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/FutureInstrumentation.java
++++ b/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/FutureInstrumentation.java
+@@ -9,6 +9,7 @@ import static io.opentelemetry.javaagent.extension.matcher.AgentElementMatchers.
+ import static java.util.logging.Level.FINE;
+ import static net.bytebuddy.matcher.ElementMatchers.named;
+ import static net.bytebuddy.matcher.ElementMatchers.returns;
++import static net.bytebuddy.matcher.ElementMatchers.takesArguments;
+ 
+ import io.opentelemetry.instrumentation.api.util.VirtualField;
+ import io.opentelemetry.javaagent.bootstrap.executors.ExecutorAdviceHelper;
+@@ -25,6 +26,11 @@ import net.bytebuddy.asm.Advice;
+ import net.bytebuddy.description.type.TypeDescription;
+ import net.bytebuddy.matcher.ElementMatcher;
+ 
++import io.opentelemetry.context.Scope;
++import io.opentelemetry.instrumentation.api.instrumenter.Instrumenter;
++import io.opentelemetry.javaagent.bootstrap.Java8BytecodeBridge;
++import io.opentelemetry.context.Context;
++
+ public class FutureInstrumentation implements TypeInstrumentation {
+   private static final Logger logger = Logger.getLogger(FutureInstrumentation.class.getName());
+ 
+@@ -92,6 +98,9 @@ public class FutureInstrumentation implements TypeInstrumentation {
+     transformer.applyAdviceToMethod(
+         named("cancel").and(returns(boolean.class)),
+         FutureInstrumentation.class.getName() + "$CanceledFutureAdvice");
++    transformer.applyAdviceToMethod(
++        named("get").and(takesArguments(0)),
++        FutureInstrumentation.class.getName() + "$FutureGetAdvice");
+   }
+ 
+   @SuppressWarnings("unused")
+@@ -107,4 +116,60 @@ public class FutureInstrumentation implements TypeInstrumentation {
+       ExecutorAdviceHelper.cleanPropagatedContext(virtualField, future);
+     }
+   }
++
++  public static class EndParentInfo{
++    public String epSpanID;
++    public EndParentInfo(String id){
++      this.epSpanID = id;
++    }
++  }
++
++  public static class FutureGetAdvice {
++
++    public static final Instrumenter<Future<?>, Void> INSTRUMENTER =
++      FutureGetInstrumenter.instrumenter();
++    @Advice.OnMethodEnter
++    public static Object enter(@Advice.This Future<?> future) {
++      try{
++          Context parent = Java8BytecodeBridge.currentContext();
++          if(parent == null){
++            return null;
++          }
++          // Instrumenter<Future<?>, Void> inst = FutureGetInstrumenter.instrumenter();
++          // if (!INSTRUMENTER.shouldStart(parent, future)) {
++          //   return null;
++          // }
++          // Context ctx = INSTRUMENTER.start(parent, future);
++          // Scope scope = ctx.makeCurrent();
++          VirtualField<Future<?>,EndParentInfo> virtualField = VirtualField.find(Future.class, EndParentInfo.class);
++          EndParentInfo epinfo = new EndParentInfo(Java8BytecodeBridge.currentSpan().getSpanContext().getSpanId());
++          virtualField.set(future, epinfo);
++          // return new Object[]{scope,ctx};
++
++      }
++      catch(Throwable e){
++      }
++      return null;
++      // // return null;
++
++
++    }
++    @Advice.OnMethodExit(onThrowable = Throwable.class)
++    public static void exit(
++        // @Advice.Enter Object states,
++        // @Advice.Thrown Throwable error,
++        @Advice.This Future<?> future
++        ) {
++        // if (states == null) {
++        //   return;
++        // }
++        // Object[] state = (Object[]) states;
++        // try {
++        //   INSTRUMENTER.end((Context)state[1], future, null, error);
++        // } finally {
++        //   ((Scope)state[0]).close();
++        // }
++
++    }
++  }
+ }
+diff --git a/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/RunnableInstrumentation.java b/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/RunnableInstrumentation.java
+index 54d06b657c..effc0b78f5 100644
+--- a/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/RunnableInstrumentation.java
++++ b/instrumentation/executors/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/executors/RunnableInstrumentation.java
+@@ -20,6 +20,11 @@ import net.bytebuddy.asm.Advice;
+ import net.bytebuddy.description.type.TypeDescription;
+ import net.bytebuddy.matcher.ElementMatcher;
+ 
++import io.opentelemetry.instrumentation.api.instrumenter.Instrumenter;
++import io.opentelemetry.javaagent.bootstrap.Java8BytecodeBridge;
++import io.opentelemetry.context.Context;
++import java.util.concurrent.Future;
++import io.opentelemetry.javaagent.instrumentation.executors.FutureInstrumentation.EndParentInfo;
+ public class RunnableInstrumentation implements TypeInstrumentation {
+ 
+   @Override
+@@ -36,19 +41,69 @@ public class RunnableInstrumentation implements TypeInstrumentation {
+ 
+   @SuppressWarnings("unused")
+   public static class RunnableAdvice {
++    public static final Instrumenter<Runnable, Void> INSTRUMENTER =
++      AsyncRunnableInstrumenter.instrumenter();
+ 
+-    @Advice.OnMethodEnter(suppress = Throwable.class)
+-    public static Scope enter(@Advice.This Runnable thiz) {
++    @Advice.OnMethodEnter//(suppress = false)
++    public static Object enter(@Advice.This Runnable thiz) {
+       VirtualField<Runnable, PropagatedContext> virtualField =
+           VirtualField.find(Runnable.class, PropagatedContext.class);
+-      return TaskAdviceHelper.makePropagatedContextCurrent(virtualField, thiz);
++
++      Scope ctx = TaskAdviceHelper.makePropagatedContextCurrent(virtualField, thiz);
++
++      // System.out.println(Thread.currentThread().getName()+": !!! In run() " + thiz +", " + Java8BytecodeBridge.currentSpan());
++      // return ctx;
++      if(ctx == null) {return null;}
++      Context parentContext = Java8BytecodeBridge.currentContext();
++      if (!INSTRUMENTER.shouldStart(parentContext, thiz)) {
++        return null;
++      }
++      Context newer = INSTRUMENTER.start(parentContext, thiz);
++      return new Object[]{parentContext,newer.makeCurrent(),ctx,newer};
++
++      // PropagatedContext ctx = virtualField.get(thiz);
++      // if (ctx == null) return null;
++      // Context parentContext = ctx.getAndClear();
++      // return parentContext.makeCurrent();
++      // return Java8BytecodeBridge.currentSpan()
++      //   .spanBuilder("async-task")
++      //   .startSpan().makeCurrent();
++      // span.makeCurrent();
++      // return span;
+     }
+ 
+     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
+-    public static void exit(@Advice.Enter Scope scope) {
+-      if (scope != null) {
+-        scope.close();
++    public static void exit(@Advice.Enter Object states, 
++        @Advice.Thrown Throwable error,
++        @Advice.This Runnable thiz) {
++      if (states == null) return;
++      Object[] state = (Object[]) states;
++      Context context = (Context) state[0];
++      Scope scope = (Scope) state[1];
++      try {
++          if(thiz instanceof Future){
++            VirtualField<Future<?>,EndParentInfo> virtualField = VirtualField.find(Future.class, EndParentInfo.class);
++            EndParentInfo epinfo = virtualField.get((Future<?>) thiz);
++            String startParent = Java8BytecodeBridge.spanFromContext(context).getSpanContext().getSpanId();
++            if(epinfo==null){
++              // R1: nobody is waiting in get() yet, so this task does not cause any waiting
++              Java8BytecodeBridge.currentSpan().setAttribute("end_parent", "0000000000000000");
++            } else {
++              if(!epinfo.epSpanID.equals(startParent)){
++                Java8BytecodeBridge.currentSpan().setAttribute("end_parent", epinfo.epSpanID);
++              }
++              virtualField.set((Future<?>)thiz,null);
++            }
++          }
++          INSTRUMENTER.end((Context)state[3], thiz, null, error);
++      } 
++      catch(Throwable e){
++      }
++      finally {
++          scope.close();
++          ((Scope)state[2]).close();
+       }
++
+     }
+   }
+ }
+diff --git a/instrumentation/opentelemetry-api/opentelemetry-api-1.0/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/opentelemetryapi/trace/ApplicationSpan.java b/instrumentation/opentelemetry-api/opentelemetry-api-1.0/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/opentelemetryapi/trace/ApplicationSpan.java
+index 5897c6dc25..1221fa0df7 100644
+--- a/instrumentation/opentelemetry-api/opentelemetry-api-1.0/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/opentelemetryapi/trace/ApplicationSpan.java
++++ b/instrumentation/opentelemetry-api/opentelemetry-api-1.0/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/opentelemetryapi/trace/ApplicationSpan.java
+@@ -16,6 +16,7 @@ import application.io.opentelemetry.api.trace.SpanKind;
+ import application.io.opentelemetry.api.trace.StatusCode;
+ import application.io.opentelemetry.context.Context;
+ import com.google.errorprone.annotations.CanIgnoreReturnValue;
++import io.opentelemetry.instrumentation.api.internal.EndParentTracker;
+ import io.opentelemetry.javaagent.instrumentation.opentelemetryapi.context.AgentContextStorage;
+ import java.util.concurrent.TimeUnit;
+ import javax.annotation.Nullable;
+@@ -137,11 +138,13 @@ class ApplicationSpan implements Span {
+ 
+   @Override
+   public void end() {
++    EndParentTracker.onEnding(agentSpan);
+     agentSpan.end();
+   }
+ 
+   @Override
+   public void end(long timestamp, TimeUnit unit) {
++    EndParentTracker.onEnding(agentSpan);
+     agentSpan.end(timestamp, unit);
+   }
+ 
+diff --git a/javaagent-tooling/src/main/java/io/opentelemetry/javaagent/tooling/AgentInstaller.java b/javaagent-tooling/src/main/java/io/opentelemetry/javaagent/tooling/AgentInstaller.java
+index 149143c8d2..2c98d1387d 100644
+--- a/javaagent-tooling/src/main/java/io/opentelemetry/javaagent/tooling/AgentInstaller.java
++++ b/javaagent-tooling/src/main/java/io/opentelemetry/javaagent/tooling/AgentInstaller.java
+@@ -17,6 +17,7 @@ import io.opentelemetry.context.Context;
+ import io.opentelemetry.context.ContextStorage;
+ import io.opentelemetry.context.Scope;
+ import io.opentelemetry.instrumentation.api.internal.EmbeddedInstrumentationProperties;
++import io.opentelemetry.instrumentation.api.internal.EndParentTracker;
+ import io.opentelemetry.javaagent.bootstrap.AgentClassLoader;
+ import io.opentelemetry.javaagent.bootstrap.BootstrapPackagePrefixesHolder;
+ import io.opentelemetry.javaagent.bootstrap.ClassFileTransformerHolder;
+@@ -42,6 +43,7 @@ import io.opentelemetry.javaagent.tooling.muzzle.AgentTooling;
+ import io.opentelemetry.javaagent.tooling.util.Trie;
+ import io.opentelemetry.sdk.autoconfigure.AutoConfiguredOpenTelemetrySdk;
+ import io.opentelemetry.sdk.autoconfigure.spi.ConfigProperties;
++import io.opentelemetry.sdk.trace.ReadableSpan;
+ import java.lang.instrument.Instrumentation;
+ import java.util.ArrayList;
+ import java.util.Collections;
+@@ -83,6 +85,11 @@ public class AgentInstaller {
+   public static void installBytebuddyAgent(Instrumentation inst, ClassLoader extensionClassLoader) {
+     addByteBuddyRawSetting();
+ 
++    // end parent tracking: keep a stack of attached contexts, read start parents from SDK spans
++    io.opentelemetry.context.ContextStorage.addWrapper(EndParentTracker::wrapContextStorage);
++    EndParentTracker.setParentLookup(
++        span -> span instanceof ReadableSpan ? ((ReadableSpan) span).getParentSpanContext() : null);
++
+     Integer strictContextStressorMillis = Integer.getInteger(STRICT_CONTEXT_STRESSOR_MILLIS);
+     if (strictContextStressorMillis != null) {
+       io.opentelemetry.context.ContextStorage.addWrapper(

@@ -1,0 +1,459 @@
+diff --git a/packages/jaeger-ui/src/components/TracePage/CriticalPath/index.ts b/packages/jaeger-ui/src/components/TracePage/CriticalPath/index.ts
+index ef338611..a873e38e 100644
+--- a/packages/jaeger-ui/src/components/TracePage/CriticalPath/index.ts
++++ b/packages/jaeger-ui/src/components/TracePage/CriticalPath/index.ts
+@@ -2,72 +2,129 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ import memoizeOne from 'memoize-one';
+-import { IOtelTrace, IOtelSpan } from '../../../types/otel';
++import { IOtelTrace } from '../../../types/otel';
+ import { CriticalPathSection, CPSpan } from '../../../types/critical_path';
+ import findLastFinishingChildSpan from './utils/findLastFinishingChildSpan';
+ import sanitizeOverFlowingChildren from './utils/sanitizeOverFlowingChildren';
+ import { createCPSpanMap } from './utils/cpspan';
+ 
++export function getSortedChildren(span: CPSpan, spanMap: map<string, CPSpan>): string[] {
++  // use copy of span's child span ids (so returns a separate list and child span ids are not modified)
++  return [...span.childSpanIDs].sort(function (a, b) {
++    // sort children in order of latest to earliest end time
++    if (spanMap.get(b)!.endTime != spanMap.get(a)!.endTime) {
++      return spanMap.get(b)!.endTime - spanMap.get(a)!.endTime;
++    } else {
++      // if there is a tie, use duration as tie breaker and sort from longest to shortest
++      return spanMap.get(b)!.duration - spanMap.get(a)!.duration;
++    }
++  });
++}
++
+ /**
+  * Computes the critical path sections of a trace.
+- * The algorithm begins with the top-level span and iterates through the last finishing children (LFCs).
+- * It recursively computes the critical path for each LFC span.
+- * Upon return from recursion, the algorithm walks backward and picks another child that
+- * finished just before the LFC's start.
++ * Updated to match the CPA2 version of critical path analysis, which is iterative and considers end parents.
++ * End parents are the spans that wait for a child span to complete (might be the same as start parent, but might be different).
++ * The iterative version of critical path analysis considers a span, then its latest finishing end child (and end children of this child if any),
++ * then the start parent of the child.
+  * @param spanMap - A map associating span IDs with spans.
+  * @param spanId - The ID of the current span.
+  * @param criticalPath - An array of critical path sections.
+- * @param returningChildStartTime - Optional parameter representing the span's start time.
+- *                    It is provided only during the recursive return phase.
++
+  * @returns - An array of critical path sections for the trace.
+  * @example -
+- * |-------------spanA--------------|
+- *    |--spanB--|    |--spanC--|
+- * The LFC of spanA is spanC, as it finishes last among its child spans.
+- * After invoking CP recursively on LFC, for spanC there is no LFC, so the algorithm walks backward.
+- * At this point, it uses returningChildStartTime (startTime of spanC) to select another child that finished
+- * immediately before the LFC's start.
++ * |-------------spanA-------------------|
++ *    |--spanB--|        |---spanD---|
++ *                    |--spanC--|
++ * The LFC of spanA is spanD, as it finishes last among its child spans.
++ * spanD is the end parent of spanC, so that is picked up next on the critical path.
++ * After spanC, return to spanA, then pick up spanB on the critical path.
+  */
+ const computeCriticalPath = (
+   spanMap: Map<string, CPSpan>,
+-  spanId: string,
+-  criticalPath: CriticalPathSection[],
+-  returningChildStartTime?: IOtelSpan['startTime']
++  rootSpanId: string,
++  criticalPath: CriticalPathSection[]
+ ): CriticalPathSection[] => {
+-  const currentSpan: CPSpan | undefined = spanMap.get(spanId);
+-  if (!currentSpan) {
++  const rootSpan: CPSpan | undefined = spanMap.get(rootSpanId);
++  if (!rootSpan) {
+     return criticalPath;
+   }
+ 
+-  const lastFinishingChildSpan = findLastFinishingChildSpan(spanMap, currentSpan, returningChildStartTime);
+-  let spanCriticalSection: CriticalPathSection;
+-
+-  if (lastFinishingChildSpan) {
+-    spanCriticalSection = {
+-      spanID: currentSpan.spanID,
+-      sectionStart: lastFinishingChildSpan.endTime,
+-      sectionEnd: (returningChildStartTime || currentSpan.endTime) as IOtelSpan['endTime'],
+-    };
+-    if (spanCriticalSection.sectionStart !== spanCriticalSection.sectionEnd) {
+-      criticalPath.push(spanCriticalSection);
++  //track current time as we iterate through the trace
++  let t = rootSpan.endTime;
++  let currentSpanId = rootSpanId;
++
++  // since last finishing child allows children with same end time as current time,
++  // prevent infinite looping by tracking the children that have been visited already
++  let visitedChildren = new Map<string, string[]>();
++
++  //permitted overlap when finding last finishing child is 1% of parent duration
++  let overlap = 0.01;
++
++  // iterate until we've reached the beginning of the trace
++  while (t > rootSpan.startTime) {
++    const currentSpan: CPSpan | undefined = spanMap.get(currentSpanId);
++    if (!currentSpan) {
++      return criticalPath;
+     }
+-    // Now focus shifts to the lastFinishingChildSpan of current span
+-    computeCriticalPath(spanMap, lastFinishingChildSpan.spanID, criticalPath);
+-  } else {
+-    // If there is no last finishing child then total section upto startTime of span is on critical path
+-    spanCriticalSection = {
+-      spanID: currentSpan.spanID,
+-      sectionStart: currentSpan.startTime,
+-      sectionEnd: (returningChildStartTime || currentSpan.endTime) as IOtelSpan['endTime'],
+-    };
+-    if (spanCriticalSection.sectionStart !== spanCriticalSection.sectionEnd) {
+-      criticalPath.push(spanCriticalSection);
++
++    // add empty list to track this span's visited children
++    if (!visitedChildren.has(currentSpanId)) {
++      visitedChildren.set(currentSpanId, []);
+     }
+-    // Now as there are no LFCs, focus shifts to parent span from startTime of span
+-    // return from recursion and walk backwards to one level depth to parent span
+-    // provide span's startTime as returningChildStartTime
+-    if (currentSpan.parentSpanID) {
+-      computeCriticalPath(spanMap, currentSpan.parentSpanID, criticalPath, currentSpan.startTime);
++
++    // get sorted list of children spans
++    // sort by descending end time, then duration if that is the same
++    const sortedChildren = getSortedChildren(currentSpan, spanMap);
++
++    // get last finishing child (based on heuristic that allows some overlaps)
++    const lastFinishingChildSpan = findLastFinishingChildSpan(
++      spanMap,
++      currentSpan,
++      sortedChildren,
++      t,
++      visitedChildren,
++      overlap
++    );
++    let spanCriticalSection: CriticalPathSection;
++
++    if (lastFinishingChildSpan) {
++      visitedChildren.get(currentSpanId)?.push(lastFinishingChildSpan.spanID);
++      // check that we haven't gone forwards in time; can happen since overlaps are permitted
++      // if that happens, don't track the critical path segment
++      if (lastFinishingChildSpan.endTime < t) {
++        spanCriticalSection = {
++          spanID: currentSpanId,
++          sectionStart: lastFinishingChildSpan.endTime,
++          sectionEnd: t,
++        };
++        if (spanCriticalSection.sectionStart !== spanCriticalSection.sectionEnd) {
++          criticalPath.push(spanCriticalSection);
++        }
++        t = lastFinishingChildSpan.endTime;
++      }
++      // next, consider the LFC (and its children, if any)
++      currentSpanId = lastFinishingChildSpan.spanID;
++    } else {
++      // span doesn't have any more children to visit, so get the rest of its time on the critical path
++      // (assuming we haven't gone forwards in time because of overlapping)
++      if (currentSpan.startTime < t) {
++        spanCriticalSection = {
++          spanID: currentSpanId,
++          sectionStart: currentSpan.startTime,
++          sectionEnd: t,
++        };
++        if (spanCriticalSection.sectionStart !== spanCriticalSection.sectionEnd) {
++          criticalPath.push(spanCriticalSection);
++        }
++        t = currentSpan.startTime;
++      }
++      // next, move to start parent
++      if (currentSpan.parentSpanID) {
++        currentSpanId = currentSpan.parentSpanID;
++      } else {
++        return criticalPath;
++      }
+     }
+   }
+   return criticalPath;
+diff --git a/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/cpspan.ts b/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/cpspan.ts
+index 992003de..18b21dc8 100644
+--- a/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/cpspan.ts
++++ b/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/cpspan.ts
+@@ -13,6 +13,23 @@ function isBlockingSpan(childKind: SpanKind, parentKind?: SpanKind): boolean {
+   return !(parentKind === SpanKind.PRODUCER && childKind === SpanKind.CONSUMER);
+ }
+ 
++/**
++ * Gets end parent if the "end_parent" attribute is set.
++ * If it is not set, returns the start parent span ID.
++ */
++function getEndParentSpanID(span: IOtelSpan): string {
++  const endParentSpanID = span.attributes?.getValue('end_parent');
++  if (endParentSpanID !== undefined) {
++    return endParentSpanID as string;
++  } else {
++    if (!span.parentSpanID) {
++      return '';
++    } else {
++      return span.parentSpanID;
++    }
++  }
++}
++
+ /**
+  * Creates a CPSpan object from an IOtelSpan.
+  */
+@@ -20,6 +37,7 @@ export function createCPSpan(span: IOtelSpan): CPSpan {
+   return {
+     spanID: span.spanID,
+     parentSpanID: span.parentSpanID,
++    endParentSpanID: getEndParentSpanID(span),
+     isBlocking: isBlockingSpan(span.kind, span.parentSpan?.kind),
+     startTime: span.startTime,
+     endTime: span.endTime,
+@@ -39,10 +57,18 @@ export function createCPSpan(span: IOtelSpan): CPSpan {
+ export function createCPSpanMap(rootSpan: IOtelSpan): Map<string, CPSpan> {
+   const spanMap = new Map<string, CPSpan>();
+ 
++  const endParentMap = new Map<string, string>();
++
+   const traverse = (span: IOtelSpan) => {
+     const cpSpan = createCPSpan(span);
+     spanMap.set(span.spanID, cpSpan);
+ 
++    // added to handle end parents: track these in a map and assign end children below
++    const endParentSpanID = span.attributes?.getValue('end_parent');
++    if (endParentSpanID !== undefined) {
++      endParentMap.set(span.spanID, endParentSpanID as string);
++    }
++
+     span.childSpans.forEach(child => {
+       // A child is blocking if it's NOT a PRODUCER -> CONSUMER relationship.
+       // THE ROOT SPAN ITSELF IS ALWAYS CONSIDERED BLOCKING (already handled by start of traversal).
+@@ -54,5 +80,17 @@ export function createCPSpanMap(rootSpan: IOtelSpan): Map<string, CPSpan> {
+   };
+ 
+   traverse(rootSpan);
++
++  // at this point, iterate through span map and add the end parent children to the childSpanIDs list
++  for (const [key, value] of endParentMap) {
++    const endParent = spanMap.get(value)!;
++    if (endParent) {
++      // add span to the end parent's children, but only if is not already in there.
++      if (!endParent.childSpanIDs.includes(key)) {
++        endParent.childSpanIDs.push(key);
++      }
++    }
++  }
++
+   return spanMap;
+ }
+diff --git a/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/findLastFinishingChildSpan.test.js b/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/findLastFinishingChildSpan.test.js
+index 1ab00461..2ba9bc8b 100644
+--- a/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/findLastFinishingChildSpan.test.js
++++ b/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/findLastFinishingChildSpan.test.js
+@@ -6,6 +6,7 @@ import test2 from '../testCases/test2';
+ import findLastFinishingChildSpanId from './findLastFinishingChildSpan';
+ import sanitizeOverFlowingChildren from './sanitizeOverFlowingChildren';
+ import { createCPSpanMap } from './cpspan';
++import { getSortedChildren } from '../index';
+ 
+ describe('findLastFinishingChildSpanId', () => {
+   it('Should find lfc of a span correctly', () => {
+@@ -13,11 +14,28 @@ describe('findLastFinishingChildSpanId', () => {
+     const sanitizedSpanMap = sanitizeOverFlowingChildren(spanMap);
+ 
+     const currentSpan = sanitizedSpanMap.get('span-C');
+-    let lastFinishingChildSpan = findLastFinishingChildSpanId(sanitizedSpanMap, currentSpan);
++    const sortedChildren = getSortedChildren(currentSpan, sanitizedSpanMap);
++    const emptyVisitedMap = new Map(); // for testing, just use empty map so all spans are considered
++    // added extra parameters to work with new version of finding last finishing child span
++    let lastFinishingChildSpan = findLastFinishingChildSpanId(
++      sanitizedSpanMap,
++      currentSpan,
++      sortedChildren,
++      currentSpan.endTime,
++      emptyVisitedMap,
++      0
++    );
+     expect(lastFinishingChildSpan).toStrictEqual(sanitizedSpanMap.get('span-E'));
+ 
+     // Second Case to check if it works with spawn time or not
+-    lastFinishingChildSpan = findLastFinishingChildSpanId(sanitizedSpanMap, currentSpan, 50);
++    lastFinishingChildSpan = findLastFinishingChildSpanId(
++      sanitizedSpanMap,
++      currentSpan,
++      sortedChildren,
++      50,
++      emptyVisitedMap,
++      0
++    );
+     expect(lastFinishingChildSpan).toStrictEqual(sanitizedSpanMap.get('span-D'));
+   });
+ 
+@@ -26,11 +44,28 @@ describe('findLastFinishingChildSpanId', () => {
+     const sanitizedSpanMap = sanitizeOverFlowingChildren(spanMap);
+ 
+     const currentSpan = sanitizedSpanMap.get('span-X');
+-    let lastFinishingChildSpanId = findLastFinishingChildSpanId(sanitizedSpanMap, currentSpan);
++    const sortedChildren = getSortedChildren(currentSpan, sanitizedSpanMap);
++    const emptyVisitedMap = new Map(); // for testing, just use empty map so all spans are considered
++    // added extra parameters to work with new version of finding last finishing child span
++    let lastFinishingChildSpanId = findLastFinishingChildSpanId(
++      sanitizedSpanMap,
++      currentSpan,
++      sortedChildren,
++      currentSpan.endTime,
++      emptyVisitedMap,
++      0
++    );
+     expect(lastFinishingChildSpanId).toStrictEqual(sanitizedSpanMap.get('span-C'));
+ 
+     // Second Case to check if it works with spawn time or not
+-    lastFinishingChildSpanId = findLastFinishingChildSpanId(sanitizedSpanMap, currentSpan, 20);
++    lastFinishingChildSpanId = findLastFinishingChildSpanId(
++      sanitizedSpanMap,
++      currentSpan,
++      sortedChildren,
++      20,
++      emptyVisitedMap,
++      0
++    );
+     expect(lastFinishingChildSpanId).toBeUndefined();
+   });
+ });
+diff --git a/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/findLastFinishingChildSpan.ts b/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/findLastFinishingChildSpan.ts
+index 367b7a25..d2e2cff3 100644
+--- a/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/findLastFinishingChildSpan.ts
++++ b/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/findLastFinishingChildSpan.ts
+@@ -4,40 +4,66 @@
+ import { CPSpan } from '../../../../types/critical_path';
+ 
+ /**
++ * @param spanMap - Map from string ID to CPSpan for all spans in the trace.
++ * @param parentSpan - Span we are trying to find the last finishing child of.
++ * @param sortedChildren - Children span ids sorted by descending end time, then largest to smallest duration
++ * @param t - Current time in critical path calculation.
++ * @param visitedChildren - Set of children spans that have already been visited from this parent; included to prevent infinite looping
++ * @param overlapThreshold - Largest permitted overlap; is a fraction from 0 to 1 that will be multiplied to parent duration to determin the
++ *                           actual duration overlap permitted.
+  * @returns - Returns the span that finished last among the remaining child spans.
+- * If a `returningChildStartTime` is provided as a parameter, it returns the child span that finishes
+- * just before the specified `returningChildStartTime`.
+  */
+ const findLastFinishingChildSpan = (
+   spanMap: Map<string, CPSpan>,
+-  currentSpan: CPSpan,
+-  returningChildStartTime?: number
++  parentSpan: CPSpan,
++  sortedChildren: string[],
++  t: number,
++  visitedChildren: Map<string, string[]>,
++  overlapThreshold: number
+ ): CPSpan | undefined => {
+-  let lastFinishingChildSpan: CPSpan | undefined;
+-  let maxEndTime = -1;
++  if (!parentSpan) {
++    return undefined;
++  }
+ 
+-  currentSpan.childSpanIDs.forEach(childId => {
++  let secondChoice: string[] = [];
++  let thirdChoice: string | undefined = undefined;
++  let delta = overlapThreshold * parentSpan.duration;
++
++  for (const childId of sortedChildren) {
+     const childSpan = spanMap.get(childId);
+-    if (!childSpan) return;
+-
+-    const childEndTime = childSpan.endTime;
+-
+-    if (returningChildStartTime) {
+-      if (childEndTime < returningChildStartTime) {
+-        if (childEndTime > maxEndTime) {
+-          maxEndTime = childEndTime;
+-          lastFinishingChildSpan = childSpan;
+-        }
+-      }
+-    } else {
+-      if (childEndTime > maxEndTime) {
+-        maxEndTime = childEndTime;
+-        lastFinishingChildSpan = childSpan;
+-      }
++    if (!childSpan) continue;
++
++    if (visitedChildren.get(parentSpan.spanID)?.includes(childSpan.spanID)) {
++      continue;
++    }
++
++    // only consider end children
++    if (childSpan.endParentSpanID != parentSpan.spanID) {
++      continue;
++    }
++
++    if (t - delta <= childSpan.endTime && childSpan.endTime <= t) {
++      // first choice child ends between the current time and t-delta
++      // if we find this, the first one should be the latest ending because the children are sorted, so return this
++      return childSpan;
++    } else if (t < childSpan.endTime && childSpan.endTime <= t + delta) {
++      // second choice allows for some overlap; i.e. going a little bit forwards in time
++      secondChoice.push(childSpan.spanID);
++    } else if (childSpan.endTime < t - delta) {
++      // third choice is strictly earlier in time, but beyond delta before the current time
++      thirdChoice = childSpan.spanID;
++      break;
+     }
+-  });
++  }
+ 
+-  return lastFinishingChildSpan;
++  if (secondChoice.length > 0) {
++    // since the children are sorted by descending end time and in this case we want the earliest end (so closest to t), get the last item in this list.
++    return spanMap.get(secondChoice.at(-1));
++  }
++  if (thirdChoice) {
++    return spanMap.get(thirdChoice);
++  }
++  return undefined;
+ };
+ 
+ export default findLastFinishingChildSpan;
+diff --git a/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/sanitizeOverFlowingChildren.ts b/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/sanitizeOverFlowingChildren.ts
+index 3e6abe74..ff3a327f 100644
+--- a/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/sanitizeOverFlowingChildren.ts
++++ b/packages/jaeger-ui/src/components/TracePage/CriticalPath/utils/sanitizeOverFlowingChildren.ts
+@@ -27,8 +27,19 @@ const sanitizeOverFlowingChildren = (spanMap: Map<string, CPSpan>): Map<string,
+       spanMap.delete(span.spanID);
+       return;
+     }
++
+     const childEndTime = span.endTime;
+-    const parentEndTime = parentSpan.endTime;
++
++    // use end parent (if exists) to get parent end time
++    var parentEndTime;
++    const endParentSpan = spanMap.get(span.endParentSpanID);
++    if (span.endParentSpanID != '0000000000000000' && endParentSpan) {
++      parentEndTime = endParentSpan.endTime;
++    } else {
++      // use start parent if end parent is invalid span
++      parentEndTime = parentSpan.endTime;
++    }
++
+     if (span.startTime >= parentSpan.startTime) {
+       if (span.startTime >= parentEndTime) {
+         // child outside of parent range => drop the child span
+diff --git a/packages/jaeger-ui/src/types/critical_path.ts b/packages/jaeger-ui/src/types/critical_path.ts
+index bda11adc..c12fdfc1 100644
+--- a/packages/jaeger-ui/src/types/critical_path.ts
++++ b/packages/jaeger-ui/src/types/critical_path.ts
+@@ -16,6 +16,7 @@ export type CriticalPathSection = {
+ export type CPSpan = {
+   spanID: string;
+   parentSpanID?: string;
++  endParentSpanID:string;
+   isBlocking: boolean; // is this span blocking the critical path of the parent?
+   startTime: IOtelSpan['startTime'];
+   endTime: IOtelSpan['endTime'];

@@ -1,0 +1,205 @@
+diff --git a/api/include/opentelemetry/context/runtime_context.h b/api/include/opentelemetry/context/runtime_context.h
+index e86b8873f0d..eac71ec7f1f 100644
+--- a/api/include/opentelemetry/context/runtime_context.h
++++ b/api/include/opentelemetry/context/runtime_context.h
+@@ -33,6 +33,11 @@ class Token
+ 
+   virtual ~Token() noexcept;
+ 
++  Context getContext() const noexcept
++  {
++    return context_;
++  }
++
+   friend class RuntimeContextStorage;
+ 
+ protected:
+@@ -68,6 +73,12 @@ class OPENTELEMETRY_EXPORT RuntimeContextStorage
+    */
+   virtual Context GetCurrent() noexcept = 0;
+ 
++  /**
++   * Return the parent context of the current context.
++   * @return the parent context of the current context
++   */
++  virtual Context GetCurrentParent() noexcept = 0;
++
+   /**
+    * Set the current context.
+    * @param context The new current context
+@@ -106,6 +117,9 @@ class OPENTELEMETRY_EXPORT RuntimeContext
+   // Return the current context.
+   static Context GetCurrent() noexcept { return GetRuntimeContextStorage()->GetCurrent(); }
+ 
++  // Return the parent context of the current context.
++  static Context GetCurrentParent() noexcept { return GetRuntimeContextStorage()->GetCurrentParent(); }
++
+   // Sets the current 'Context' object. Returns a token
+   // that can be used to reset to the previous Context.
+   static nostd::unique_ptr<Token> Attach(const Context &context) noexcept
+@@ -214,6 +228,9 @@ class ThreadLocalContextStorage : public RuntimeContextStorage
+   // Return the current context.
+   Context GetCurrent() noexcept override { return GetStack().Top(); }
+ 
++  // Return the parent context of the current context.
++  Context GetCurrentParent() noexcept override { return GetStack().TopNext(); }
++
+   // Resets the context to the value previous to the passed in token. This will
+   // also detach all child contexts of the passed in token.
+   // Returns true if successful, false otherwise.
+@@ -328,6 +345,16 @@ class ThreadLocalContextStorage : public RuntimeContextStorage
+       return base_[size_ - 1];
+     }
+ 
++    // Returns the next Context under the top of the stack.
++    Context TopNext() const noexcept
++    {
++      if (size_ == 0 || size_ == 1)
++      {
++        return Context();
++      }
++      return base_[size_ - 2];
++    }
++
+     // Pushes the passed in context pointer to the top of the stack
+     // and resizes if necessary.
+     void Push(const Context &context) noexcept
+diff --git a/api/include/opentelemetry/trace/scope.h b/api/include/opentelemetry/trace/scope.h
+index 20c415cc726..b3594b38ea9 100644
+--- a/api/include/opentelemetry/trace/scope.h
++++ b/api/include/opentelemetry/trace/scope.h
+@@ -7,6 +7,7 @@
+ #include "opentelemetry/context/runtime_context.h"
+ #include "opentelemetry/nostd/shared_ptr.h"
+ #include "opentelemetry/nostd/unique_ptr.h"
++#include "opentelemetry/trace/context.h"
+ #include "opentelemetry/trace/span.h"
+ #include "opentelemetry/trace/span_metadata.h"
+ #include "opentelemetry/version.h"
+@@ -34,6 +35,20 @@ class Scope final
+             context::RuntimeContext::GetCurrent().SetValue(kSpanKey, span)))
+   {}
+ 
++  Scope(Scope&& other) = default;
++  Scope& operator=(Scope&& other) = default;
++  Scope(const Scope& other) = delete;
++  Scope& operator=(const Scope& other) = delete;
++
++  ~Scope() noexcept
++  {
++    nostd::shared_ptr<Span> span = opentelemetry::trace::GetSpan(token_->getContext());
++    if (span->GetContext().IsValid()) {
++      // If span is valid, end it when its scope is destroyed
++      span->End();
++    }
++  }
++
+ private:
+   nostd::unique_ptr<context::Token> token_;
+ };
+diff --git a/api/include/opentelemetry/trace/span.h b/api/include/opentelemetry/trace/span.h
+index f26e38e4eea..61f00536c6c 100644
+--- a/api/include/opentelemetry/trace/span.h
++++ b/api/include/opentelemetry/trace/span.h
+@@ -250,6 +250,10 @@ class Span
+ 
+   virtual trace::SpanContext GetContext() const noexcept = 0;
+ 
++  virtual trace::SpanId GetParentSpanId() const noexcept {
++    return opentelemetry::trace::SpanId();
++  }
++
+   // Returns true if this Span is recording tracing events (e.g. SetAttribute,
+   // AddEvent).
+   virtual bool IsRecording() const noexcept = 0;
+diff --git a/api/include/opentelemetry/trace/span_id.h b/api/include/opentelemetry/trace/span_id.h
+index 22ae82de35d..06a7a963c06 100644
+--- a/api/include/opentelemetry/trace/span_id.h
++++ b/api/include/opentelemetry/trace/span_id.h
+@@ -65,6 +65,13 @@ class SpanId final
+     std::memcpy(dest.data(), rep_, kSize);
+   }
+ 
++  // Returns a std::string of the ID for setting the end_parent attribute.
++  std::string getSpanIdString() const noexcept {
++    char span_id_buf[kSize * 2];
++    this->ToLowerBase16(span_id_buf);
++    return std::string(span_id_buf, sizeof(span_id_buf));
++  }
++
+ private:
+   uint8_t rep_[kSize]{};
+ };
+diff --git a/sdk/src/trace/span.cc b/sdk/src/trace/span.cc
+index 8d5ad947fa9..5252eafffbc 100644
+--- a/sdk/src/trace/span.cc
++++ b/sdk/src/trace/span.cc
+@@ -5,10 +5,16 @@
+ #include <map>
+ #include <utility>
+ 
++#include "opentelemetry/context/context.h"
++#include "opentelemetry/context/context_value.h"
++#include "opentelemetry/context/runtime_context.h"
+ #include "opentelemetry/nostd/function_ref.h"
++#include "opentelemetry/nostd/span.h"
+ #include "opentelemetry/sdk/trace/processor.h"
+ #include "opentelemetry/sdk/trace/recordable.h"
+ #include "opentelemetry/sdk/trace/span_status.h"
++#include "opentelemetry/trace/propagation/http_trace_context.h"
++#include "opentelemetry/trace/provider.h"
+ #include "opentelemetry/trace/span_id.h"
+ #include "opentelemetry/trace/span_metadata.h"
+ #include "opentelemetry/trace/trace_flags.h"
+@@ -63,7 +69,9 @@ Span::Span(std::shared_ptr<Tracer> &&tracer,
+     : tracer_{std::move(tracer)},
+       recordable_{tracer_->GetProcessor().MakeRecordable()},
+       start_steady_time{options.start_steady_time},
+-      span_context_(std::move(span_context))
++      span_context_(std::move(span_context)),
++      parent_span_id_(parent_span_context.IsValid() ? parent_span_context.span_id() : opentelemetry::trace::SpanId())
++
+ {
+   if (recordable_ == nullptr)
+   {
+@@ -242,6 +250,19 @@ void Span::End(const opentelemetry::trace::EndSpanOptions &options) noexcept
+   recordable_->SetDuration(std::chrono::steady_clock::time_point(end_steady_time) -
+                            std::chrono::steady_clock::time_point(start_steady_time));
+ 
++  // Automatically add end parent if the current span when the span is ended different from its start parent
++  opentelemetry::trace::SpanId active_span_id = opentelemetry::trace::Provider::GetTracerProvider()->GetTracer("testTracer")->GetCurrentSpan()->GetContext().span_id();
++  opentelemetry::trace::SpanId ending_span_id = span_context_.span_id();
++  // If the span being ended was marked as active, it could still be active at this point
++  // In this case, we consider the second item in the context stack
++  if (active_span_id == ending_span_id) {
++    active_span_id = opentelemetry::trace::GetSpan(opentelemetry::context::RuntimeContext::GetCurrentParent())->GetContext().span_id();
++  }
++
++  if (active_span_id != parent_span_id_) {
++    recordable_->SetAttribute("end_parent", active_span_id.getSpanIdString());
++  }
++
+   tracer_->GetProcessor().OnEnd(std::move(recordable_));
+   recordable_.reset();
+ }
+diff --git a/sdk/src/trace/span.h b/sdk/src/trace/span.h
+index a68ded35d78..0842c3061e3 100644
+--- a/sdk/src/trace/span.h
++++ b/sdk/src/trace/span.h
+@@ -77,6 +77,8 @@ class Span final : public opentelemetry::trace::Span
+   bool IsRecording() const noexcept override;
+ 
+   opentelemetry::trace::SpanContext GetContext() const noexcept override { return span_context_; }
++  opentelemetry::trace::SpanId GetParentSpanId() const noexcept override { return parent_span_id_; }
++
+ 
+ private:
+   std::shared_ptr<Tracer> tracer_;
+@@ -86,6 +88,7 @@ class Span final : public opentelemetry::trace::Span
+   opentelemetry::trace::SpanContext span_context_;
+   opentelemetry::trace::StatusCode status_code_{opentelemetry::trace::StatusCode::kUnset};
+   bool has_ended_{false};
++  opentelemetry::trace::SpanId parent_span_id_;
+ };
+ }  // namespace trace
+ }  // namespace sdk
