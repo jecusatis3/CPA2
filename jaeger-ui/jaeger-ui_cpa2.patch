@@ -1,8 +1,8 @@
 diff --git a/packages/jaeger-ui/src/components/TracePage/CriticalPath/index.ts b/packages/jaeger-ui/src/components/TracePage/CriticalPath/index.ts
-index ef338611..a873e38e 100644
+index ef338611..b45ba861 100644
 --- a/packages/jaeger-ui/src/components/TracePage/CriticalPath/index.ts
 +++ b/packages/jaeger-ui/src/components/TracePage/CriticalPath/index.ts
-@@ -2,72 +2,129 @@
+@@ -2,72 +2,130 @@
  // SPDX-License-Identifier: Apache-2.0
  
  import memoizeOne from 'memoize-one';
@@ -14,7 +14,8 @@ index ef338611..a873e38e 100644
  import { createCPSpanMap } from './utils/cpspan';
  
 +export function getSortedChildren(span: CPSpan, spanMap: map<string, CPSpan>): string[] {
-+  // use copy of span's child span ids (so returns a separate list and child span ids are not modified)
++  // use copy of span's child span ids (so returns a separate list)
++  // note that this is not required (CPSpan's child ids could just be sorted), but implemented this way to be most similar to Python end parent critical path analysis
 +  return [...span.childSpanIDs].sort(function (a, b) {
 +    // sort children in order of latest to earliest end time
 +    if (spanMap.get(b)!.endTime != spanMap.get(a)!.endTime) {

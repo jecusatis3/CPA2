@@ -1332,10 +1332,10 @@ index cfbb8915..1491dbb7 100644
  		MoveLibraryAttributes(),
  		RemoveEmptySpanLinks(),
 diff --git a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/standard_test.go b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/standard_test.go
-index d2fadfe2..8042a137 100644
+index d2fadfe2..947a42b8 100644
 --- a/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/standard_test.go
 +++ b/cmd/jaeger/internal/extension/jaegerquery/internal/adjuster/standard_test.go
-@@ -12,14 +12,20 @@ import (
+@@ -12,14 +12,19 @@ import (
  
  func TestStandardAdjusters(t *testing.T) {
  	maxClockSkewAdjust := 10 * time.Second
@@ -1353,7 +1353,6 @@ index d2fadfe2..8042a137 100644
 +	synthesizeDroppedSpansEnabled := true
 +	fillGapsAndExtendParentsEnabled := true
 +	adjusters := StandardAdjusters(addRootSpanEnabled, synthesizeDroppedSpansEnabled, fillGapsAndExtendParentsEnabled, maxClockSkewAdjust)
-+	//TODO: update with number of adjusters
 +	assert.Len(t, adjusters, 10, "Expected 10 adjusters")
 +	assert.IsType(t, AddRootSpan(addRootSpanEnabled), adjusters[0])
 +	assert.IsType(t, DeduplicateClientServerSpanIDs(), adjusters[1])
